@@ -24,7 +24,8 @@ const systemSettingRoutes = require("./routes/systemSetting.routes");
 const notificationHistoryRoutes = require("./routes/notificationHistory.routes");
 
 const app = express();
-
+// Cloudflare Tunnel chạy trên cùng máy chủ
+app.set("trust proxy", "loopback");
 // ==========================================
 // SECURITY
 // ==========================================

@@ -249,7 +249,7 @@ function startWorker(camera) {
     "error",
     "-rtsp_transport",
     "tcp",
-    "-rw_timeout",
+    "-timeout",
     "10000000",
     "-i",
     rtspUrl,
