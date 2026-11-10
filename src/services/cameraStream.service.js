@@ -181,12 +181,30 @@ function logFrameError(worker, error) {
   console.error(`[CAMERA ${worker.id}] Lỗi xử lý frame:\n`, safeError(stack));
 }
 
+function logFrameStatus(worker, message) {
+  const now = Date.now();
+
+  // Mỗi camera chỉ log trạng thái tối đa 10 giây/lần.
+  if (now - (worker.lastStatusLogAt || 0) < 10000) {
+    return;
+  }
+
+  worker.lastStatusLogAt = now;
+
+  console.log(
+    `[CAMERA ${worker.id}] ${message} | ` +
+      `Frames: ${worker.framesReceived || 0} | ` +
+      `AI processed: ${worker.framesProcessed || 0}`,
+  );
+}
+
 async function processFrame(worker, imageBuffer) {
   if (worker.processing || worker.stopping || stopping) {
     return;
   }
 
   worker.processing = true;
+  worker.framesProcessed = (worker.framesProcessed || 0) + 1;
 
   try {
     const result = await matchFace(imageBuffer);
@@ -202,6 +220,14 @@ async function processFrame(worker, imageBuffer) {
     const identity = getEventIdentity(result);
     const eventKey = `${worker.id}:${identity}`;
     const now = Date.now();
+
+    // Log kết quả nhận diện tối đa 10 giây/lần.
+    logFrameStatus(
+      worker,
+      `AI RESULT: ${String(result.status).toUpperCase()} - ${
+        result.person?.full_name || result.message || "Chưa xác định danh tính"
+      }`,
+    );
 
     const cooldown =
       result.status === "unknown" ? UNKNOWN_COOLDOWN : EVENT_COOLDOWN;
@@ -223,26 +249,27 @@ async function processFrame(worker, imageBuffer) {
       });
 
       console.log(
-        `[CAMERA ${worker.id}] ${String(result.status).toUpperCase()}:`,
+        `[CAMERA ${worker.id}] EVENT SAVED:`,
+        String(result.status).toUpperCase(),
         result.person?.full_name || result.message || "Không xác định",
         result.similarity != null ? `(${result.similarity})` : "",
       );
     } catch (error) {
-      // Nếu ghi DB thất bại, cho phép thử lại.
       lastEvents.delete(eventKey);
       throw error;
     }
   } catch (error) {
     const message = String(error?.message || "").toLowerCase();
 
-    // Không log liên tục nếu không có khuôn mặt.
     const isNormalNoFace =
       message.includes("no face") ||
       message.includes("không phát hiện") ||
       message.includes("không tìm thấy khuôn mặt") ||
       message.includes("no valid face");
 
-    if (!isNormalNoFace) {
+    if (isNormalNoFace) {
+      logFrameStatus(worker, "Đang hoạt động, chưa phát hiện khuôn mặt");
+    } else {
       logFrameError(worker, error);
     }
   } finally {
@@ -276,6 +303,11 @@ function startWorker(camera) {
     connected: false,
     stopping: false,
     lastErrorLogAt: 0,
+
+    framesReceived: 0,
+    framesProcessed: 0,
+    lastStatusLogAt: 0,
+
     signature: JSON.stringify({
       protocol: camera.protocol,
       config,
@@ -362,6 +394,8 @@ function startWorker(camera) {
       for (const frame of parsed.frames) {
         if (worker.stopping || stopping) break;
 
+        worker.framesReceived++;
+
         if (!worker.connected) {
           worker.connected = true;
 
@@ -370,9 +404,15 @@ function startWorker(camera) {
           console.log(`[CAMERA ${id}] RTSP CONNECTED`);
         }
 
-        // Mỗi camera chỉ xử lý một frame tại một thời điểm.
         if (!worker.processing) {
           processFrame(worker, frame);
+        }
+
+        if (worker.framesReceived === 1 || worker.framesReceived % 10 === 0) {
+          logFrameStatus(
+            worker,
+            `Đã nhận frame JPEG (${(frame.length / 1024).toFixed(1)} KB)`,
+          );
         }
       }
     } catch (error) {
