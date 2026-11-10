@@ -2,23 +2,26 @@ const { spawn } = require("child_process");
 const { pool } = require("../config/database");
 const { matchFace } = require("./faceRecognition.service");
 const { recordRecognitionEvent } = require("./recognitionEvent.service");
-
 const ffmpeg = require("ffmpeg-static");
 
 const SYNC_INTERVAL = 5000;
-const RECONNECT_DELAY = 10000;
-const EVENT_COOLDOWN = Math.max(
-  Number(process.env.FACE_EVENT_COOLDOWN_MS || 60000),
-  10000,
-);
-const UNKNOWN_COOLDOWN = Math.max(
-  Number(process.env.FACE_UNKNOWN_COOLDOWN_MS || 120000),
-  10000,
-);
 const FRAME_INTERVAL = Math.max(
   Number(process.env.CAMERA_FRAME_INTERVAL_SECONDS || 2),
   1,
 );
+
+const EVENT_COOLDOWN = Math.max(
+  Number(process.env.FACE_EVENT_COOLDOWN_MS || 60000),
+  10000,
+);
+
+const UNKNOWN_COOLDOWN = Math.max(
+  Number(process.env.FACE_UNKNOWN_COOLDOWN_MS || 120000),
+  10000,
+);
+
+const ERROR_LOG_INTERVAL = 30000;
+const MAX_BUFFER_SIZE = 15 * 1024 * 1024;
 
 const workers = new Map();
 const lastEvents = new Map();
@@ -74,9 +77,14 @@ function buildRtspUrl(config) {
 }
 
 function safeError(error) {
-  return String(error || "Lỗi kết nối RTSP")
-    .replace(/rtsp:\/\/[^\s]+/gi, "rtsp://[đã ẩn]")
-    .slice(0, 1000);
+  return String(error || "Lỗi không xác định")
+    .replace(/rtsp:\/\/[^\s"'<>]+/gi, "rtsp://[đã ẩn]")
+    .replace(/(password|passwd|pwd)=([^&\s]+)/gi, "$1=[đã ẩn]")
+    .slice(0, 2000);
+}
+
+function getErrorMessage(error) {
+  return safeError(error?.message || error || "Lỗi không xác định");
 }
 
 async function updateCameraStatus(id, status, error = null) {
@@ -90,6 +98,7 @@ async function updateCameraStatus(id, status, error = null) {
          WHERE id = ?`,
         [id],
       );
+
       return;
     }
 
@@ -102,13 +111,13 @@ async function updateCameraStatus(id, status, error = null) {
   } catch (err) {
     console.error(
       `[CAMERA ${id}] Không cập nhật được trạng thái:`,
-      err.message,
+      getErrorMessage(err),
     );
   }
 }
 
 /**
- * Tách JPEG từ luồng image2pipe.
+ * Tách các frame JPEG từ luồng image2pipe.
  */
 function extractJpegs(buffer) {
   const frames = [];
@@ -118,22 +127,28 @@ function extractJpegs(buffer) {
     const start = remaining.indexOf(Buffer.from([0xff, 0xd8]));
 
     if (start === -1) {
-      remaining = remaining.slice(Math.max(0, remaining.length - 1));
+      remaining = remaining.slice(-1);
       break;
     }
 
-    const end = remaining.indexOf(Buffer.from([0xff, 0xd9]), start + 2);
+    if (start > 0) {
+      remaining = remaining.slice(start);
+    }
+
+    const end = remaining.indexOf(Buffer.from([0xff, 0xd9]), 2);
 
     if (end === -1) {
-      remaining = remaining.slice(start);
       break;
     }
 
-    frames.push(remaining.slice(start, end + 2));
-    remaining = remaining.slice(end + 2);
+    frames.push(remaining.subarray(0, end + 2));
+    remaining = remaining.subarray(end + 2);
   }
 
-  return { frames, remaining };
+  return {
+    frames,
+    remaining,
+  };
 }
 
 function getEventIdentity(result) {
@@ -143,19 +158,46 @@ function getEventIdentity(result) {
 
   if (result.status === "uncertain") {
     const candidate = result.candidates?.[0];
+
     return `uncertain:${candidate?.person_id || "unknown"}`;
   }
 
   return "unknown";
 }
 
+function logFrameError(worker, error) {
+  const now = Date.now();
+
+  if (now - worker.lastErrorLogAt < ERROR_LOG_INTERVAL) {
+    return;
+  }
+
+  worker.lastErrorLogAt = now;
+
+  // Ghi stack đầy đủ để tìm đúng package gây lỗi.
+  // Không ghi URL RTSP hoặc thông tin đăng nhập.
+  const stack = error?.stack || error?.message || error;
+
+  console.error(`[CAMERA ${worker.id}] Lỗi xử lý frame:\n`, safeError(stack));
+}
+
 async function processFrame(worker, imageBuffer) {
-  if (worker.processing || worker.stopping) return;
+  if (worker.processing || worker.stopping || stopping) {
+    return;
+  }
 
   worker.processing = true;
 
   try {
     const result = await matchFace(imageBuffer);
+
+    if (!result || !result.status) {
+      throw new Error("Face AI không trả về kết quả hợp lệ");
+    }
+
+    if (worker.stopping || stopping) {
+      return;
+    }
 
     const identity = getEventIdentity(result);
     const eventKey = `${worker.id}:${identity}`;
@@ -170,41 +212,38 @@ async function processFrame(worker, imageBuffer) {
       return;
     }
 
-    // Đánh dấu trước khi lưu để tránh hai frame đồng thời ghi trùng.
+    // Đánh dấu trước khi ghi DB để tránh ghi trùng.
     lastEvents.set(eventKey, now);
 
     try {
-      const history = await recordRecognitionEvent({
+      await recordRecognitionEvent({
         imageBuffer,
         result,
         cameraId: worker.id,
       });
 
       console.log(
-        `[CAMERA ${worker.id}] ${result.status.toUpperCase()}:`,
-        result.person?.full_name || result.message,
-        `(${result.similarity})`,
+        `[CAMERA ${worker.id}] ${String(result.status).toUpperCase()}:`,
+        result.person?.full_name || result.message || "Không xác định",
+        result.similarity != null ? `(${result.similarity})` : "",
       );
-
-      return history;
     } catch (error) {
-      // Cho phép thử lại nếu lưu sự kiện thất bại.
+      // Nếu ghi DB thất bại, cho phép thử lại.
       lastEvents.delete(eventKey);
       throw error;
     }
   } catch (error) {
-    const message = String(error.message || "");
+    const message = String(error?.message || "").toLowerCase();
 
-    // Không ghi log liên tục khi frame không có khuôn mặt.
-    if (
-      !message.toLowerCase().includes("no face") &&
-      !message.toLowerCase().includes("không phát hiện") &&
-      !message.toLowerCase().includes("không tìm thấy khuôn mặt")
-    ) {
-      console.error(
-        `[CAMERA ${worker.id}] Lỗi xử lý frame:`,
-        safeError(message),
-      );
+    // Không log liên tục nếu không có khuôn mặt.
+    const isNormalNoFace =
+      message.includes("no face") ||
+      message.includes("không phát hiện") ||
+      message.includes("không tìm thấy khuôn mặt") ||
+      message.includes("no valid face");
+
+    if (!isNormalNoFace) {
+      logFrameError(worker, error);
     }
   } finally {
     worker.processing = false;
@@ -218,10 +257,14 @@ function startWorker(camera) {
   let rtspUrl;
 
   try {
+    if (!ffmpeg) {
+      throw new Error("Không tìm thấy FFmpeg từ package ffmpeg-static");
+    }
+
     rtspUrl = buildRtspUrl(config);
   } catch (error) {
-    updateCameraStatus(id, "error", safeError(error.message));
-    console.error(`[CAMERA ${id}]`, error.message);
+    updateCameraStatus(id, "error", getErrorMessage(error));
+    console.error(`[CAMERA ${id}]`, getErrorMessage(error));
     return;
   }
 
@@ -232,6 +275,7 @@ function startWorker(camera) {
     processing: false,
     connected: false,
     stopping: false,
+    lastErrorLogAt: 0,
     signature: JSON.stringify({
       protocol: camera.protocol,
       config,
@@ -247,77 +291,109 @@ function startWorker(camera) {
     "-hide_banner",
     "-loglevel",
     "error",
+
     "-rtsp_transport",
     "tcp",
+
+    // Timeout RTSP, đơn vị micro giây.
     "-timeout",
     "10000000",
+
     "-i",
     rtspUrl,
+
     "-an",
     "-sn",
     "-dn",
+
     "-vf",
     `fps=1/${FRAME_INTERVAL}`,
+
     "-f",
     "image2pipe",
     "-vcodec",
     "mjpeg",
     "-q:v",
     "5",
+
     "pipe:1",
   ];
 
-  const child = spawn(ffmpeg, args, {
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let child;
 
-  worker.process = child;
+  try {
+    child = spawn(ffmpeg, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    worker.process = child;
+  } catch (error) {
+    workers.delete(id);
+    updateCameraStatus(id, "error", getErrorMessage(error));
+
+    console.error(
+      `[CAMERA ${id}] Không khởi chạy được FFmpeg:`,
+      getErrorMessage(error),
+    );
+
+    return;
+  }
 
   let stderr = "";
 
   child.stdout.on("data", async (chunk) => {
-    if (worker.stopping) return;
+    if (worker.stopping || stopping) return;
 
-    worker.buffer = Buffer.concat([worker.buffer, chunk]);
+    try {
+      worker.buffer = Buffer.concat([worker.buffer, chunk]);
 
-    const parsed = extractJpegs(worker.buffer);
-    worker.buffer = parsed.remaining;
+      const parsed = extractJpegs(worker.buffer);
 
-    // Chống bộ nhớ tăng không giới hạn nếu luồng lỗi.
-    if (worker.buffer.length > 10 * 1024 * 1024) {
-      worker.buffer = Buffer.alloc(0);
-    }
+      worker.buffer = parsed.remaining;
 
-    for (const frame of parsed.frames) {
-      if (!worker.connected) {
-        worker.connected = true;
-
-        await updateCameraStatus(id, "active");
-
-        console.log(`[CAMERA ${id}] RTSP CONNECTED`);
+      if (worker.buffer.length > MAX_BUFFER_SIZE) {
+        worker.buffer = Buffer.alloc(0);
+        console.error(
+          `[CAMERA ${id}] Buffer vượt giới hạn, đã giải phóng bộ nhớ`,
+        );
       }
 
-      // Bỏ frame mới nếu AI vẫn đang xử lý frame trước.
-      if (!worker.processing) {
-        processFrame(worker, frame);
+      for (const frame of parsed.frames) {
+        if (worker.stopping || stopping) break;
+
+        if (!worker.connected) {
+          worker.connected = true;
+
+          await updateCameraStatus(id, "active");
+
+          console.log(`[CAMERA ${id}] RTSP CONNECTED`);
+        }
+
+        // Mỗi camera chỉ xử lý một frame tại một thời điểm.
+        if (!worker.processing) {
+          processFrame(worker, frame);
+        }
       }
+    } catch (error) {
+      logFrameError(worker, error);
     }
   });
 
   child.stderr.on("data", (chunk) => {
     stderr += chunk.toString();
 
-    if (stderr.length > 3000) {
-      stderr = stderr.slice(-3000);
+    if (stderr.length > 5000) {
+      stderr = stderr.slice(-5000);
     }
   });
 
-  child.on("error", (error) => {
-    console.error(
-      `[CAMERA ${id}] Không chạy được FFmpeg:`,
-      safeError(error.message),
-    );
+  child.on("error", async (error) => {
+    const detail = getErrorMessage(error);
+
+    console.error(`[CAMERA ${id}] FFmpeg process error:`, detail);
+
+    await updateCameraStatus(id, "error", detail);
   });
 
   child.on("close", async (code) => {
@@ -337,37 +413,50 @@ function startWorker(camera) {
     await updateCameraStatus(id, "error", detail);
 
     console.error(`[CAMERA ${id}] RTSP DISCONNECTED:`, detail);
+
+    // Worker sẽ được syncCameras khởi động lại.
   });
 }
 
 async function stopWorker(id) {
-  const worker = workers.get(Number(id));
+  const cameraId = Number(id);
+  const worker = workers.get(cameraId);
 
   if (!worker) {
-    await updateCameraStatus(id, "inactive");
+    await updateCameraStatus(cameraId, "inactive");
     return;
   }
 
   worker.stopping = true;
-  workers.delete(Number(id));
+  workers.delete(cameraId);
 
   try {
-    if (worker.process && !worker.process.killed) {
+    if (
+      worker.process &&
+      worker.process.exitCode === null &&
+      !worker.process.killed
+    ) {
       worker.process.kill();
     }
   } catch (error) {
-    console.error(`[CAMERA ${id}] Không dừng được FFmpeg:`, error.message);
+    console.error(
+      `[CAMERA ${cameraId}] Không dừng được FFmpeg:`,
+      getErrorMessage(error),
+    );
   }
 
-  await updateCameraStatus(id, "inactive");
-  console.log(`[CAMERA ${id}] Đã dừng`);
+  await updateCameraStatus(cameraId, "inactive");
+
+  console.log(`[CAMERA ${cameraId}] Đã dừng`);
 }
 
 /**
- * Đồng bộ camera từ MySQL:
+ * Đồng bộ camera từ MySQL.
+ *
  * - Tự chạy camera RTSP đang bật.
  * - Tự dừng camera bị tắt.
- * - Tự khởi động lại nếu cấu hình thay đổi hoặc tiến trình chết.
+ * - Tự khởi động lại nếu cấu hình thay đổi.
+ * - Tự khởi động lại khi FFmpeg bị chết.
  */
 async function syncCameras() {
   if (syncing || stopping) return;
@@ -386,20 +475,23 @@ async function syncCameras() {
         AND is_enabled = 1
     `);
 
-    const enabledIds = new Set(cameras.map((item) => Number(item.id)));
+    const enabledIds = new Set(cameras.map((camera) => Number(camera.id)));
 
+    // Dừng worker không còn được bật.
     for (const [id] of workers) {
       if (!enabledIds.has(id)) {
         await stopWorker(id);
       }
     }
 
+    // Khởi động hoặc cập nhật worker.
     for (const camera of cameras) {
       const id = Number(camera.id);
-      const currentConfig = parseConfig(camera.connection_config);
+      const config = parseConfig(camera.connection_config);
+
       const signature = JSON.stringify({
         protocol: camera.protocol,
-        config: currentConfig,
+        config,
       });
 
       const existing = workers.get(id);
@@ -412,10 +504,21 @@ async function syncCameras() {
         await stopWorker(id);
       }
 
-      startWorker(camera);
+      if (!stopping) {
+        startWorker(camera);
+      }
+    }
+
+    // Xóa lịch sử cooldown cũ để tránh Map tăng mãi.
+    const now = Date.now();
+
+    for (const [key, timestamp] of lastEvents) {
+      if (now - timestamp > 24 * 60 * 60 * 1000) {
+        lastEvents.delete(key);
+      }
     }
   } catch (error) {
-    console.error("[CAMERA STREAM] Sync error:", error.message);
+    console.error("[CAMERA STREAM] Sync error:", getErrorMessage(error));
   } finally {
     syncing = false;
   }
@@ -453,7 +556,7 @@ function getCameraStreamStatus() {
     camera_id: id,
     connected: worker.connected,
     processing: worker.processing,
-    running: Boolean(worker.process && !worker.process.killed),
+    running: Boolean(worker.process && worker.process.exitCode === null),
   }));
 }
 
