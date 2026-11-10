@@ -1,5 +1,3 @@
-// src/services/telegram.service.js
-
 const { pool } = require("../config/database");
 const { encryptSecret, decryptSecret } = require("../utils/secretEncryption");
 
@@ -189,7 +187,7 @@ async function telegramPhotoRequest(token, data) {
     throw new Error("Ảnh gửi Telegram không hợp lệ");
   }
 
-  const extension = filename.split(".").pop().toLowerCase();
+  const extension = String(filename).split(".").pop().toLowerCase();
 
   const mimeTypes = {
     jpg: "image/jpeg",
@@ -325,7 +323,6 @@ async function writeNotificationLog(data) {
       ],
     );
   } catch (error) {
-    // Lỗi lưu lịch sử không được làm ảnh hưởng luồng nhận diện.
     console.error("[NOTIFICATION HISTORY ERROR]:", error.message);
   }
 }
@@ -337,60 +334,75 @@ async function writeNotificationLog(data) {
 async function sendRecognitionNotification(data = {}) {
   const settings = await getSettingsRow();
 
-  if (!settings || !settings.is_enabled) {
+  const emptyResult = {
+    sent: false,
+    sent_count: 0,
+    failed_count: 0,
+    total_recipients: 0,
+  };
+
+  if (!settings || !Number(settings.is_enabled)) {
+    console.log("[TELEGRAM] Bỏ qua: Telegram đang tắt");
+
     return {
-      sent: false,
+      ...emptyResult,
       reason: "telegram_disabled",
-      sent_count: 0,
-      failed_count: 0,
-      total_recipients: 0,
     };
   }
 
-  const status = data.recognition_status;
+  const status = String(data.recognition_status || "")
+    .trim()
+    .toLowerCase();
 
-  if (!["known", "unknown"].includes(status)) {
+  const supportedStatuses = ["known", "unknown", "uncertain"];
+
+  if (!supportedStatuses.includes(status)) {
+    console.log("[TELEGRAM] Trạng thái không hỗ trợ:", status);
+
     return {
-      sent: false,
+      ...emptyResult,
       reason: "unsupported_status",
-      sent_count: 0,
-      failed_count: 0,
-      total_recipients: 0,
     };
   }
 
-  if (status === "known" && !settings.notify_known) {
+  if (status === "known" && !Number(settings.notify_known)) {
     return {
-      sent: false,
+      ...emptyResult,
       reason: "known_notification_disabled",
-      sent_count: 0,
-      failed_count: 0,
-      total_recipients: 0,
     };
   }
 
-  if (status === "unknown" && !settings.notify_unknown) {
+  if (
+    ["unknown", "uncertain"].includes(status) &&
+    !Number(settings.notify_unknown)
+  ) {
     return {
-      sent: false,
+      ...emptyResult,
       reason: "unknown_notification_disabled",
-      sent_count: 0,
-      failed_count: 0,
-      total_recipients: 0,
     };
   }
 
   if (!settings.bot_token_encrypted) {
     return {
-      sent: false,
+      ...emptyResult,
       reason: "telegram_not_configured",
-      sent_count: 0,
-      failed_count: 0,
-      total_recipients: 0,
     };
   }
 
-  const token = decryptSecret(settings.bot_token_encrypted);
+  let token;
 
+  try {
+    token = decryptSecret(settings.bot_token_encrypted);
+  } catch (error) {
+    console.error("[TELEGRAM] Không giải mã được Bot Token:", error.message);
+
+    return {
+      ...emptyResult,
+      reason: "token_decryption_failed",
+    };
+  }
+
+  // Chọn tùy chọn nhận thông báo theo trạng thái.
   const preferenceColumn =
     status === "known" ? "notify_known" : "notify_unknown";
 
@@ -400,30 +412,31 @@ async function sendRecognitionNotification(data = {}) {
       FROM telegram_user_links
       WHERE is_active = 1
         AND ${preferenceColumn} = 1
+        AND chat_id IS NOT NULL
+        AND chat_id != ''
     `,
   );
 
   const recipients = new Set(links.map((item) => String(item.chat_id)));
 
-  // Giữ khả năng gửi đến Chat ID quản trị cũ.
+  // Chat ID quản trị cũ vẫn được nhận thông báo.
   if (settings.chat_id) {
     recipients.add(String(settings.chat_id));
   }
 
   if (!recipients.size) {
     return {
-      sent: false,
+      ...emptyResult,
       reason: "no_active_recipients",
-      sent_count: 0,
-      failed_count: 0,
-      total_recipients: 0,
     };
   }
 
   const personName =
     status === "known"
       ? escapeHtml(data.person_name || "Chưa có tên")
-      : "Người chưa xác định";
+      : status === "uncertain"
+        ? "Chưa xác định chắc chắn"
+        : "Người chưa xác định";
 
   const cameraName = escapeHtml(data.camera_name || "Camera không xác định");
 
@@ -441,10 +454,23 @@ async function sendRecognitionNotification(data = {}) {
       ? `${(confidence * 100).toFixed(2)}%`
       : "Không xác định";
 
+  let heading;
+
+  switch (status) {
+    case "known":
+      heading = "🟢 <b>PHÁT HIỆN NGƯỜI ĐÃ ĐĂNG KÝ</b>";
+      break;
+
+    case "uncertain":
+      heading = "🟠 <b>PHÁT HIỆN KHUÔN MẶT CHƯA XÁC ĐỊNH</b>";
+      break;
+
+    default:
+      heading = "🔴 <b>PHÁT HIỆN NGƯỜI LẠ</b>";
+  }
+
   const message = [
-    status === "known"
-      ? "🟢 <b>PHÁT HIỆN NGƯỜI ĐÃ ĐĂNG KÝ</b>"
-      : "🔴 <b>PHÁT HIỆN NGƯỜI LẠ</b>",
+    heading,
     "",
     `👤 Đối tượng: <b>${personName}</b>`,
     `📷 Camera: ${cameraName}`,
@@ -459,19 +485,23 @@ async function sendRecognitionNotification(data = {}) {
     .filter(Boolean)
     .join("\n");
 
-  const sendType =
-    Buffer.isBuffer(data.imageBuffer) && data.imageBuffer.length
-      ? "photo"
-      : "message";
+  const hasImage =
+    Buffer.isBuffer(data.imageBuffer) && data.imageBuffer.length > 0;
+
+  const sendType = hasImage ? "photo" : "message";
 
   const title =
-    status === "known" ? "Phát hiện người đã đăng ký" : "Phát hiện người lạ";
+    status === "known"
+      ? "Phát hiện người đã đăng ký"
+      : status === "uncertain"
+        ? "Phát hiện khuôn mặt chưa xác định"
+        : "Phát hiện người lạ";
 
   const sendTasks = Array.from(recipients).map(async (chatId) => {
     try {
       let telegramResult;
 
-      if (sendType === "photo") {
+      if (hasImage) {
         telegramResult = await telegramPhotoRequest(token, {
           chatId,
           imageBuffer: data.imageBuffer,
@@ -501,6 +531,12 @@ async function sendRecognitionNotification(data = {}) {
         telegram_message_id: telegramResult?.message_id || null,
       });
 
+      console.log("[TELEGRAM] Gửi thành công:", {
+        status,
+        chat_id: chatId,
+        event_id: data.event_id || null,
+      });
+
       return {
         chat_id: chatId,
         success: true,
@@ -517,7 +553,8 @@ async function sendRecognitionNotification(data = {}) {
         error_message: error.message,
       });
 
-      console.error("[TELEGRAM] Send failed:", {
+      console.error("[TELEGRAM] Gửi thất bại:", {
+        status,
         chat_id: chatId,
         error: error.message,
       });
@@ -541,6 +578,7 @@ async function sendRecognitionNotification(data = {}) {
     sent_count: sentCount,
     failed_count: failedCount,
     total_recipients: recipients.size,
+    reason: sentCount > 0 ? null : "all_recipients_failed",
   };
 }
 
