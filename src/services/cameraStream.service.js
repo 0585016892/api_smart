@@ -564,16 +564,22 @@ async function syncCameras() {
   }
 }
 
-function startCameraStreamService() {
+async function startCameraStreamService() {
   if (syncTimer) return;
 
   stopping = false;
 
   console.log("[CAMERA STREAM] Service starting...");
 
-  syncCameras();
+  // Chờ lần đồng bộ đầu tiên hoàn thành.
+  await syncCameras();
+
+  // Tránh tạo timer nếu service đã được yêu cầu dừng.
+  if (stopping) return;
 
   syncTimer = setInterval(syncCameras, SYNC_INTERVAL);
+
+  console.log("[CAMERA STREAM] Service started");
 }
 
 async function stopCameraStreamService() {

@@ -5,75 +5,120 @@ const { testConnection } = require("./config/database");
 const telegramBotService = require("./services/telegramBot.service");
 const cameraStreamService = require("./services/cameraStream.service");
 
-const PORT = process.env.PORT || 12005;
-const path = require("path");
-const express = require("express");
+const PORT = Number(process.env.PORT) || 12005;
+const HOST = "0.0.0.0";
 
-app.use("/faces", express.static(path.join(__dirname, "uploads", "faces")));
-
+let server = null;
 let shuttingDown = false;
+let cameraStarted = false;
+let telegramStarted = false;
 
-const startServer = async () => {
-  try {
-    // 1. Kiểm tra MySQL.
-    await testConnection();
+const startHttpServer = () =>
+  new Promise((resolve, reject) => {
+    const httpServer = app.listen(PORT, HOST);
 
-    // 2. Khởi động Telegram.
-    telegramBotService.startTelegramBot();
+    httpServer.once("listening", () => resolve(httpServer));
 
-    // 3. Khởi động HTTP API.
-    const server = app.listen(PORT, "0.0.0.0", () => {
-      console.log("");
-      console.log("====================================");
-      console.log(" SMART FACE SECURITY");
-      console.log("====================================");
-      console.log(` API: http://localhost:${PORT}`);
-      console.log(` Health: http://localhost:${PORT}/api/health`);
-      console.log(" Status: RUNNING");
-      console.log("====================================");
-      console.log("");
+    httpServer.once("error", (error) => {
+      reject(error);
     });
+  });
 
-    // 4. Khởi động quản lý camera RTSP.
-    cameraStreamService.startCameraStreamService();
+const shutdown = async (signal = "UNKNOWN", exitCode = 0) => {
+  if (shuttingDown) return;
 
-    const shutdown = async (signal) => {
-      if (shuttingDown) return;
+  shuttingDown = true;
 
-      shuttingDown = true;
+  console.log(`[SERVER] Received ${signal}, shutting down...`);
 
-      console.log(`[SERVER] Received ${signal}, shutting down...`);
+  try {
+    if (cameraStarted) {
+      await cameraStreamService.stopCameraStreamService();
+      cameraStarted = false;
+    }
 
-      try {
-        // Dừng camera và tiến trình FFmpeg trước.
-        await cameraStreamService.stopCameraStreamService();
+    if (telegramStarted) {
+      telegramBotService.stopTelegramBot();
+      telegramStarted = false;
+    }
 
-        // Dừng Telegram.
-        telegramBotService.stopTelegramBot();
+    if (server) {
+      await new Promise((resolve) => {
+        server.close((error) => {
+          if (error) {
+            console.error("[SERVER] HTTP close error:", error.message);
+          } else {
+            console.log("[SERVER] HTTP server closed");
+          }
 
-        // Đóng HTTP server.
-        server.close(() => {
-          console.log("[SERVER] HTTP server closed");
-          process.exit(0);
+          resolve();
         });
+      });
 
-        // Không để server treo vô thời hạn.
-        setTimeout(() => {
-          console.error("[SERVER] Shutdown timeout");
-          process.exit(1);
-        }, 15000).unref();
-      } catch (error) {
-        console.error("[SERVER] Shutdown error:", error);
-        process.exit(1);
-      }
-    };
+      server = null;
+    }
 
-    process.on("SIGINT", () => shutdown("SIGINT"));
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.exit(exitCode);
   } catch (error) {
-    console.error("SERVER START ERROR:", error);
+    console.error("[SERVER] Shutdown error:", error);
     process.exit(1);
   }
 };
 
-startServer();
+const startServer = async () => {
+  try {
+    console.log("[SERVER] Starting Smart Face Security...");
+
+    // 1. Kiểm tra MySQL
+    await testConnection();
+
+    // 2. Khởi động HTTP API
+    server = await startHttpServer();
+
+    console.log("");
+    console.log("====================================");
+    console.log(" SMART FACE SECURITY");
+    console.log("====================================");
+    console.log(` API: http://localhost:${PORT}`);
+    console.log(` Health: http://localhost:${PORT}/api/health`);
+    console.log(" Status: RUNNING");
+    console.log("====================================");
+    console.log("");
+
+    // 3. Khởi động Telegram
+    telegramBotService.startTelegramBot();
+    telegramStarted = true;
+
+    // 4. Khởi động camera
+    cameraStarted = true;
+    await cameraStreamService.startCameraStreamService();
+  } catch (error) {
+    console.error("[SERVER] START ERROR:", error);
+
+    if (error.code === "EADDRINUSE") {
+      console.error(`[SERVER] Port ${PORT} is already in use.`);
+    }
+
+    await shutdown("START_ERROR", 1);
+  }
+};
+
+process.on("SIGINT", () => shutdown("SIGINT", 0));
+process.on("SIGTERM", () => shutdown("SIGTERM", 0));
+
+process.on("uncaughtException", (error) => {
+  console.error("[SERVER] Uncaught exception:", error);
+  shutdown("UNCAUGHT_EXCEPTION", 1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[SERVER] Unhandled rejection:", reason);
+  shutdown("UNHANDLED_REJECTION", 1);
+});
+
+// Chỉ tự khởi động khi chạy trực tiếp bằng Node/PM2.
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { startServer, shutdown };
