@@ -24,28 +24,11 @@ function parseEmbedding(value) {
 }
 
 /**
- * Sau khi nhận diện, tự động lưu lịch sử và snapshot.
+ * Chỉ phân tích khuôn mặt, không tự động ghi sự kiện.
  */
-async function saveRecognitionResult(result, imageBuffer, cameraId) {
-  const history = await recordRecognitionEvent({
-    imageBuffer,
-    result,
-    cameraId,
-  });
-
-  return {
-    ...result,
-    history,
-  };
-}
-
-async function recognizeFace(imageBuffer, options = {}) {
-  const cameraId = options.cameraId ?? null;
-
-  // 1. Trích xuất embedding của ảnh cần kiểm tra.
+async function matchFace(imageBuffer) {
   const detected = await extractFaceEmbedding(imageBuffer);
 
-  // 2. Lấy các mẫu khuôn mặt đang hoạt động.
   const [rows] = await pool.query(`
     SELECT
       fp.id AS face_profile_id,
@@ -55,38 +38,33 @@ async function recognizeFace(imageBuffer, options = {}) {
       p.full_name,
       p.category
     FROM face_profiles fp
-    INNER JOIN persons p
-      ON p.id = fp.person_id
+    INNER JOIN persons p ON p.id = fp.person_id
     WHERE
       fp.status = 'active'
       AND p.status = 'active'
       AND fp.embedding IS NOT NULL
   `);
 
-  // 3. Chưa có dữ liệu khuôn mặt.
   if (!rows.length) {
-    const result = {
+    return {
       status: "unknown",
       message: "Chưa có dữ liệu khuôn mặt để đối chiếu",
       similarity: 0,
       person: null,
       candidates: [],
     };
-
-    return saveRecognitionResult(result, imageBuffer, cameraId);
   }
 
   const human = await getHuman();
-
-  // 4. So sánh với từng ảnh mẫu.
   const personMatches = new Map();
 
   for (const row of rows) {
     const storedEmbedding = parseEmbedding(row.embedding);
 
-    if (!storedEmbedding) continue;
-
-    if (storedEmbedding.length !== detected.embedding.length) {
+    if (
+      !storedEmbedding ||
+      storedEmbedding.length !== detected.embedding.length
+    ) {
       continue;
     }
 
@@ -111,21 +89,18 @@ async function recognizeFace(imageBuffer, options = {}) {
     }
   }
 
-  // 5. Xếp hạng kết quả.
   const ranked = [...personMatches.values()].sort(
     (a, b) => b.similarity - a.similarity,
   );
 
   if (!ranked.length) {
-    const result = {
+    return {
       status: "unknown",
       message: "Không có mẫu khuôn mặt hợp lệ để đối chiếu",
       similarity: 0,
       person: null,
       candidates: [],
     };
-
-    return saveRecognitionResult(result, imageBuffer, cameraId);
   }
 
   const bestMatch = ranked[0];
@@ -141,11 +116,10 @@ async function recognizeFace(imageBuffer, options = {}) {
     message = "Kết quả chưa đủ chắc chắn, cần kiểm tra";
   }
 
-  const result = {
+  return {
     status,
     message,
     similarity: Number(bestMatch.similarity.toFixed(4)),
-
     person:
       status === "unknown"
         ? null
@@ -155,7 +129,6 @@ async function recognizeFace(imageBuffer, options = {}) {
             full_name: bestMatch.full_name,
             category: bestMatch.category,
           },
-
     candidates: ranked.slice(0, 3).map((item) => ({
       person_id: item.person_id,
       person_code: item.person_code,
@@ -163,11 +136,34 @@ async function recognizeFace(imageBuffer, options = {}) {
       similarity: Number(item.similarity.toFixed(4)),
     })),
   };
+}
 
-  // 6. Lưu sự kiện, snapshot và cập nhật phiên xuất hiện.
-  return saveRecognitionResult(result, imageBuffer, cameraId);
+/**
+ * Giữ tương thích API cũ:
+ * mặc định vẫn phân tích và lưu sự kiện như trước.
+ *
+ * Truyền { persist: false } nếu chỉ muốn lấy kết quả AI.
+ */
+async function recognizeFace(imageBuffer, options = {}) {
+  const result = await matchFace(imageBuffer);
+
+  if (options.persist === false) {
+    return result;
+  }
+
+  const history = await recordRecognitionEvent({
+    imageBuffer,
+    result,
+    cameraId: options.cameraId ?? null,
+  });
+
+  return {
+    ...result,
+    history,
+  };
 }
 
 module.exports = {
   recognizeFace,
+  matchFace,
 };

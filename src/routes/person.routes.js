@@ -17,7 +17,7 @@ const { uploadPersonAvatar } = require("../middleware/upload.middleware");
 // Tất cả API đều yêu cầu đăng nhập
 router.use(authenticate);
 
-// Thống kê
+// Thống kêa
 router.get("/statistics", getPersonStatistics);
 
 // Danh sách người
