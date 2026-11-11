@@ -46,6 +46,15 @@ const TRACK_DISTANCE_RATIO = 0.65;
 const JPEG_START = Buffer.from([0xff, 0xd8]);
 const JPEG_END = Buffer.from([0xff, 0xd9]);
 
+const FFMPEG_LOG_LEVEL = process.env.CAMERA_FFMPEG_LOG_LEVEL || "warning";
+
+const RESTART_BASE_DELAY_MS = 5000;
+const RESTART_MAX_DELAY_MS = 60000;
+const RESTART_STABLE_TIME_MS = 30000;
+
+const STDERR_BUFFER_LIMIT = 12000;
+const STDERR_LOG_INTERVAL = 3000;
+
 // ======================================================
 // GLOBAL STATE
 // ======================================================
@@ -173,7 +182,59 @@ function safeError(error) {
     .replace(/rtsp:\/\/[^@\s]+@/gi, "rtsp://***@")
     .slice(0, 1000);
 }
+function redactSensitiveText(value) {
+  return String(value || "")
+    .replace(/(rtsp:\/\/)[^@\s]+@/gi, "$1***@")
+    .replace(/(password|passwd|pwd)=([^&\s]+)/gi, "$1=***")
+    .slice(0, 3000);
+}
 
+function formatExitCode(code) {
+  if (code === null || code === undefined) {
+    return {
+      code: null,
+      hex: null,
+      signed: null,
+    };
+  }
+
+  const unsigned = Number(code) >>> 0;
+
+  return {
+    code,
+    hex: `0x${unsigned.toString(16).toUpperCase().padStart(8, "0")}`,
+    signed: unsigned > 0x7fffffff ? unsigned - 0x100000000 : unsigned,
+  };
+}
+
+function getRestartDelay(worker) {
+  const attempt = Math.max(0, worker.restartAttempts || 0);
+
+  return Math.min(
+    RESTART_BASE_DELAY_MS * Math.pow(2, Math.min(attempt, 4)),
+    RESTART_MAX_DELAY_MS,
+  );
+}
+
+function appendFfmpegStderr(worker, text) {
+  const message = redactSensitiveText(text).trim();
+
+  if (!message) return;
+
+  worker.stderrTail = `${worker.stderrTail || ""}\n${message}`;
+
+  if (worker.stderrTail.length > STDERR_BUFFER_LIMIT) {
+    worker.stderrTail = worker.stderrTail.slice(-STDERR_BUFFER_LIMIT);
+  }
+
+  const now = Date.now();
+
+  if (now - (worker.lastFfmpegLogAt || 0) >= STDERR_LOG_INTERVAL) {
+    console.error(`[CAMERA ${worker.id}] FFMPEG STDERR:\n${message}`);
+
+    worker.lastFfmpegLogAt = now;
+  }
+}
 // ======================================================
 // CAMERA RTSP CONFIG
 // ======================================================
@@ -223,8 +284,9 @@ function buildRtspUrl(camera) {
 function getFfmpegArgs(rtspUrl) {
   return [
     "-hide_banner",
+    "-nostdin",
     "-loglevel",
-    "error",
+    FFMPEG_LOG_LEVEL,
 
     "-rtsp_transport",
     "tcp",
@@ -939,6 +1001,13 @@ function createWorker(camera) {
 
     frameQueueBusy: false,
     lastFrameProcessAt: 0,
+
+    // FFmpeg diagnostics
+    processStartedAt: null,
+    lastFfmpegLogAt: 0,
+    stderrTail: "",
+    restartAttempts: 0,
+    lastFfmpegExit: null,
   };
 }
 
@@ -977,19 +1046,29 @@ function stopWorker(worker) {
 }
 
 function scheduleWorkerRestart(worker) {
-  if (!worker || worker.stopping) return;
-
-  if (worker.unsupported) return;
+  if (!worker || worker.stopping || worker.unsupported) return;
 
   if (worker.restartTimer) return;
+
+  const delay = getRestartDelay(worker);
+
+  worker.restartAttempts = (worker.restartAttempts || 0) + 1;
+
+  worker.lastRestartAt = Date.now();
+
+  console.warn(`[CAMERA ${worker.id}] SCHEDULE RESTART`, {
+    attempt: worker.restartAttempts,
+    delayMs: delay,
+    nextRestartAt: new Date(Date.now() + delay).toISOString(),
+  });
 
   worker.restartTimer = setTimeout(() => {
     worker.restartTimer = null;
 
-    if (worker.stopping) return;
+    if (worker.stopping || worker.process) return;
 
     startWorker(worker);
-  }, 5000);
+  }, delay);
 
   if (worker.restartTimer.unref) {
     worker.restartTimer.unref();
@@ -998,21 +1077,17 @@ function scheduleWorkerRestart(worker) {
 
 function startWorker(worker) {
   if (!worker || worker.stopping) return;
-
   if (worker.process) return;
-
+  if (worker.restartTimer) return;
   if (worker.unsupported) return;
-
   const sourceType = getCameraSourceType(worker.camera);
 
   worker.sourceType = sourceType;
 
-  // Webcam trình duyệt.
   if (sourceType === "browser_webcam") {
     worker.unsupported = true;
     worker.processing = false;
     worker.connected = false;
-
     worker.sourceError =
       "Webcam trình duyệt cần gửi frame từ frontend lên backend";
 
@@ -1023,12 +1098,10 @@ function startWorker(worker) {
     return;
   }
 
-  // Camera upload.
   if (sourceType === "upload") {
     worker.unsupported = true;
     worker.processing = false;
     worker.connected = false;
-
     worker.sourceError = "Camera upload không sử dụng RTSP";
 
     console.log(`[CAMERA ${worker.id}] UPLOAD SOURCE - BỎ QUA RTSP`);
@@ -1040,7 +1113,6 @@ function startWorker(worker) {
     worker.unsupported = true;
     worker.processing = false;
     worker.connected = false;
-
     worker.sourceError = "Camera chưa có cấu hình RTSP được hỗ trợ";
 
     console.error(`[CAMERA ${worker.id}] UNSUPPORTED CAMERA SOURCE`);
@@ -1077,29 +1149,82 @@ function startWorker(worker) {
 
   worker.unsupported = false;
   worker.sourceError = null;
+  worker.stopping = false;
+
+  worker.buffer = Buffer.alloc(0);
+  worker.stderrTail = "";
+  worker.lastFfmpegLogAt = 0;
 
   const args = getFfmpegArgs(rtspUrl);
 
-  console.log(`[CAMERA ${worker.id}] STARTING RTSP STREAM`);
+  const startedAt = Date.now();
 
-  worker.stopping = false;
-  worker.processing = true;
+  console.log(`[CAMERA ${worker.id}] STARTING FFMPEG`, {
+    ffmpegPath,
+    logLevel: FFMPEG_LOG_LEVEL,
+    fps: CAMERA_STREAM_FPS,
+    aiInterval: CAMERA_AI_INTERVAL_MS,
+    transport: "tcp",
+    startedAt: new Date(startedAt).toISOString(),
 
-  const ffmpeg = spawn(ffmpegPath, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
+    // Không in RTSP URL vì có thể chứa username/password.
+    args: args.map((arg) => (arg === rtspUrl ? "[REDACTED_RTSP_URL]" : arg)),
   });
+
+  worker.processing = true;
+  worker.connected = false;
+  worker.processStartedAt = startedAt;
+
+  let ffmpeg;
+
+  try {
+    ffmpeg = spawn(ffmpegPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  } catch (error) {
+    worker.processing = false;
+    worker.connected = false;
+    worker.sourceError = safeError(error);
+
+    console.error(
+      `[CAMERA ${worker.id}] FFMPEG SPAWN THROW:`,
+      worker.sourceError,
+    );
+
+    scheduleWorkerRestart(worker);
+    return;
+  }
 
   worker.process = ffmpeg;
 
+  ffmpeg.on("spawn", () => {
+    console.log(`[CAMERA ${worker.id}] FFMPEG PROCESS STARTED`, {
+      pid: ffmpeg.pid || null,
+      startedAt: new Date(startedAt).toISOString(),
+    });
+  });
+
   ffmpeg.stdout.on("data", (chunk) => {
-    if (worker.stopping) return;
+    if (worker.stopping || worker.process !== ffmpeg) return;
+
+    const now = Date.now();
 
     worker.connected = true;
+
+    // Nếu camera đã chạy ổn định 30 giây thì reset backoff.
+    if (now - startedAt >= RESTART_STABLE_TIME_MS) {
+      worker.restartAttempts = 0;
+    }
 
     worker.buffer = Buffer.concat([worker.buffer, chunk]);
 
     if (worker.buffer.length > MAX_BUFFER_SIZE) {
+      console.warn(`[CAMERA ${worker.id}] FRAME BUFFER OVERFLOW`, {
+        bufferSize: worker.buffer.length,
+        maxBufferSize: MAX_BUFFER_SIZE,
+      });
+
       worker.buffer = worker.buffer.subarray(-Math.floor(MAX_BUFFER_SIZE / 2));
     }
 
@@ -1110,21 +1235,18 @@ function startWorker(worker) {
     for (const frame of extracted.frames) {
       const capturedAt = Date.now();
 
-      // Frame thô mới nhất, phục vụ API cũ.
       worker.latestFrame = frame;
       worker.latestFrameAt = capturedAt;
 
-      const now = Date.now();
-
       if (
         worker.frameQueueBusy ||
-        now - worker.lastFrameProcessAt < CAMERA_AI_INTERVAL_MS
+        capturedAt - worker.lastFrameProcessAt < CAMERA_AI_INTERVAL_MS
       ) {
         continue;
       }
 
       worker.frameQueueBusy = true;
-      worker.lastFrameProcessAt = now;
+      worker.lastFrameProcessAt = capturedAt;
 
       processFrame(worker, frame, capturedAt)
         .catch((error) => {
@@ -1140,30 +1262,28 @@ function startWorker(worker) {
   });
 
   ffmpeg.stderr.on("data", (data) => {
-    const message = String(data || "").trim();
-
-    if (!message) return;
-
-    const now = Date.now();
-
-    if (now - worker.lastErrorLogAt >= ERROR_LOG_INTERVAL) {
-      console.error(`[CAMERA ${worker.id}] FFMPEG: ${message.slice(0, 500)}`);
-
-      worker.lastErrorLogAt = now;
-    }
+    appendFfmpegStderr(worker, data.toString());
   });
 
   ffmpeg.on("error", (error) => {
     worker.sourceError = safeError(error);
 
-    console.error(
-      `[CAMERA ${worker.id}] FFMPEG SPAWN ERROR:`,
-      worker.sourceError,
-    );
+    console.error(`[CAMERA ${worker.id}] FFMPEG PROCESS ERROR`, {
+      message: worker.sourceError,
+      pid: ffmpeg.pid || null,
+      startedAt: new Date(startedAt).toISOString(),
+      elapsedMs: Date.now() - startedAt,
+    });
   });
 
-  ffmpeg.on("close", (code) => {
-    if (worker.process === ffmpeg) {
+  ffmpeg.on("close", (code, signal) => {
+    const closedAt = Date.now();
+    const elapsedMs = closedAt - startedAt;
+    const exitInfo = formatExitCode(code);
+
+    const isCurrentProcess = worker.process === ffmpeg;
+
+    if (isCurrentProcess) {
       worker.process = null;
     }
 
@@ -1171,11 +1291,44 @@ function startWorker(worker) {
     worker.processing = false;
     worker.buffer = Buffer.alloc(0);
 
-    console.log(`[CAMERA ${worker.id}] FFMPEG CLOSED | CODE: ${code}`);
+    worker.lastFfmpegExit = {
+      ...exitInfo,
+      signal: signal || null,
+      elapsedMs,
+      closedAt,
+    };
 
-    if (!worker.stopping) {
-      scheduleWorkerRestart(worker);
+    // Nếu tiến trình chạy ổn định đủ lâu thì không tăng backoff.
+    if (elapsedMs >= RESTART_STABLE_TIME_MS) {
+      worker.restartAttempts = 0;
     }
+
+    console.error(`[CAMERA ${worker.id}] FFMPEG CLOSED`, {
+      ...exitInfo,
+      signal: signal || null,
+      pid: ffmpeg.pid || null,
+      elapsedMs,
+      startedAt: new Date(startedAt).toISOString(),
+      closedAt: new Date(closedAt).toISOString(),
+      wasCurrentProcess: isCurrentProcess,
+      stopping: worker.stopping,
+      stderr: worker.stderrTail || "(FFmpeg không trả stderr)",
+    });
+
+    // Không giữ frame cũ làm frame LIVE mới sau khi stream đã chết.
+    if (isCurrentProcess) {
+      worker.latestFrame = null;
+      worker.latestFrameAt = null;
+      worker.latestSnapshot = null;
+    }
+
+    if (worker.stopping || !isCurrentProcess) {
+      return;
+    }
+
+    worker.sourceError = `FFmpeg đã thoát: ${exitInfo.hex || code}, signal: ${signal || "none"}`;
+
+    scheduleWorkerRestart(worker);
   });
 }
 
@@ -1322,6 +1475,19 @@ function getCameraStreamStatus() {
     const now = Date.now();
 
     return {
+      last_ffmpeg_exit: worker.lastFfmpegExit,
+
+      ffmpeg_pid: worker.process?.pid || null,
+
+      ffmpeg_started_at: worker.processStartedAt
+        ? new Date(worker.processStartedAt).toISOString()
+        : null,
+
+      restart_attempts: worker.restartAttempts,
+
+      restart_pending: Boolean(worker.restartTimer),
+
+      ffmpeg_stderr: worker.stderrTail || null,
       camera_id: id,
 
       camera_name:
