@@ -104,44 +104,11 @@ async function cleanup(req, res, next) {
     next(error);
   }
 }
-const {
-  bulkDeleteRecognitionEvents,
-  bulkDeleteRecognitionSessions,
-} = require("../services/recognitionHistory.service");
 
-async function deleteBulkEvents(req, res, next) {
-  try {
-    const result = await bulkDeleteRecognitionEvents(req.body.ids);
-
-    return res.json({
-      success: true,
-      message: `Đã xóa ${result.deleted} sự kiện nhận diện`,
-      data: result,
-    });
-  } catch (error) {
-    next(error);
-  }
-}
-
-async function deleteBulkSessions(req, res, next) {
-  try {
-    const result = await bulkDeleteRecognitionSessions(req.body.ids);
-
-    return res.json({
-      success: true,
-      message: `Đã xóa ${result.deleted} phiên vào/ra`,
-      data: result,
-    });
-  } catch (error) {
-    next(error);
-  }
-}
 module.exports = {
   getList,
   getDetail,
   getStats,
   remove,
   cleanup,
-  deleteBulkEvents,
-  deleteBulkSessions,
 };

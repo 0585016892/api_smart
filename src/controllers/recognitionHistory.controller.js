@@ -121,11 +121,45 @@ async function getSessionDetail(req, res, next) {
     next(error);
   }
 }
+exports.deleteBulkEvents = async (req, res, next) => {
+  try {
+    const { ids } = req.body;
 
+    const result =
+      await recognitionHistoryService.bulkDeleteRecognitionEvents(ids);
+
+    return res.json({
+      success: true,
+      message: "Xóa lịch sử nhận diện thành công",
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.deleteBulkSessions = async (req, res, next) => {
+  try {
+    const { ids } = req.body;
+
+    const result =
+      await recognitionHistoryService.bulkDeleteRecognitionSessions(ids);
+
+    return res.json({
+      success: true,
+      message: "Xóa phiên ra vào thành công",
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 module.exports = {
   getEvents,
   getEventDetail,
   getEventSnapshot,
   getSessions,
   getSessionDetail,
+  deleteBulkSessions,
+  deleteBulkEvents,
 };
