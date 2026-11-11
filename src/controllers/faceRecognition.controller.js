@@ -27,6 +27,7 @@ async function recognizeFaceHandler(req, res, next) {
 
     const result = await recognizeFace(req.file.buffer, {
       cameraId,
+      persist: false,
     });
 
     return res.json({

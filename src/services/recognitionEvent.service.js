@@ -1,5 +1,4 @@
 const crypto = require("crypto");
-
 const { pool } = require("../config/database");
 
 const {
@@ -23,9 +22,7 @@ function createSessionCode() {
 }
 
 function toNullableId(value) {
-  if (value === undefined || value === null || value === "") {
-    return null;
-  }
+  if (value === undefined || value === null || value === "") return null;
 
   const parsed = Number(value);
 
@@ -38,33 +35,20 @@ function toNullableId(value) {
   return parsed;
 }
 
-/**
- * Đóng các phiên đã quá thời gian không phát hiện.
- */
 async function closeExpiredSessions(connection) {
   await connection.query(
     `
       UPDATE recognition_sessions
       SET
         session_status = 'closed',
-        check_out_at = DATE_ADD(
-          last_seen_at,
-          INTERVAL ? MINUTE
-        )
-      WHERE
-        session_status = 'open'
-        AND last_seen_at < DATE_SUB(
-          NOW(),
-          INTERVAL ? MINUTE
-        )
+        check_out_at = DATE_ADD(last_seen_at, INTERVAL ? MINUTE)
+      WHERE session_status = 'open'
+        AND last_seen_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)
     `,
     [SESSION_TIMEOUT_MINUTES, SESSION_TIMEOUT_MINUTES],
   );
 }
 
-/**
- * Lưu hoặc cập nhật phiên xuất hiện của người đã nhận diện.
- */
 async function updateRecognitionSession(connection, data) {
   const { personId, cameraId, snapshotPath } = data;
 
@@ -72,19 +56,12 @@ async function updateRecognitionSession(connection, data) {
 
   const [sessions] = await connection.query(
     `
-      SELECT
-        id,
-        session_code,
-        event_count
+      SELECT id, session_code, event_count
       FROM recognition_sessions
-      WHERE
-        person_id = ?
+      WHERE person_id = ?
         AND camera_id <=> ?
         AND session_status = 'open'
-        AND last_seen_at >= DATE_SUB(
-          NOW(),
-          INTERVAL ? MINUTE
-        )
+        AND last_seen_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE)
       ORDER BY last_seen_at DESC
       LIMIT 1
       FOR UPDATE
@@ -141,17 +118,11 @@ async function updateRecognitionSession(connection, data) {
   };
 }
 
-/**
- * Ghi nhận một sự kiện nhận diện.
- *
- * Lưu ý:
- * Hàm này chỉ được gọi một lần cho mỗi lượt xuất hiện
- * từ cameraStream.service.js.
- */
 async function recordRecognitionEvent({
   imageBuffer,
   result,
   cameraId: rawCameraId = null,
+  notifyTelegram,
 }) {
   if (!result || !["known", "unknown", "uncertain"].includes(result.status)) {
     throw new Error("Kết quả nhận diện không hợp lệ");
@@ -170,13 +141,12 @@ async function recordRecognitionEvent({
 
   const faceCount = Math.max(
     0,
-    Math.min(
-      20,
-      Number(result.faceCount ?? (result.faceDetected ? 1 : 0)) || 0,
-    ),
+    Math.min(20, Number(result.faceCount ?? 1) || 0),
   );
 
-  // Lưu snapshot trước khi ghi database.
+  const shouldNotify =
+    notifyTelegram === true && ["unknown", "uncertain"].includes(result.status);
+
   const snapshot = await saveRecognitionSnapshot(imageBuffer);
 
   let connection;
@@ -184,23 +154,18 @@ async function recordRecognitionEvent({
   let responseData = null;
 
   let cameraName = "Camera không xác định";
-  let personName =
-    result.person?.full_name || result.person?.name || "Chưa có tên";
+  let personName = result.person?.full_name || "Chưa có tên";
 
   try {
     connection = await pool.getConnection();
-
     await connection.beginTransaction();
 
-    // Kiểm tra camera.
     if (cameraId !== null) {
       const [cameras] = await connection.query(
         `
           SELECT id, camera_name
           FROM cameras
-          WHERE id = ?
-            AND status = 'active'
-            AND is_enabled = 1
+          WHERE id = ? AND status = 'active' AND is_enabled = 1
           LIMIT 1
         `,
         [cameraId],
@@ -210,7 +175,6 @@ async function recordRecognitionEvent({
         const error = new Error(
           "Camera không tồn tại hoặc đang bị vô hiệu hóa",
         );
-
         error.statusCode = 400;
         throw error;
       }
@@ -218,21 +182,13 @@ async function recordRecognitionEvent({
       cameraName = cameras[0].camera_name;
     }
 
-    // Lấy tên người đã nhận diện từ database.
     if (personId) {
       const [persons] = await connection.query(
-        `
-          SELECT id, full_name
-          FROM persons
-          WHERE id = ?
-          LIMIT 1
-        `,
+        "SELECT id, full_name FROM persons WHERE id = ? LIMIT 1",
         [personId],
       );
 
-      if (persons.length) {
-        personName = persons[0].full_name;
-      }
+      if (persons.length) personName = persons[0].full_name;
     }
 
     await closeExpiredSessions(connection);
@@ -277,7 +233,6 @@ async function recordRecognitionEvent({
     }
 
     await connection.commit();
-
     committed = true;
 
     responseData = {
@@ -306,17 +261,14 @@ async function recordRecognitionEvent({
 
     throw error;
   } finally {
-    if (connection) {
-      connection.release();
-    }
+    if (connection) connection.release();
 
     if (!committed) {
       await deleteRecognitionSnapshot(snapshot.relativePath);
     }
   }
 
-  // Chỉ gửi Telegram sau khi database đã COMMIT.
-  if (committed) {
+  if (committed && shouldNotify) {
     try {
       const notificationResult =
         await telegramService.sendRecognitionNotification({
@@ -326,7 +278,6 @@ async function recordRecognitionEvent({
           person_name: personName,
           camera_name: cameraName,
           confidence,
-
           imageBuffer,
           filename: snapshot.filename,
         });
@@ -335,9 +286,8 @@ async function recordRecognitionEvent({
         await pool.query(
           `
             UPDATE recognition_events
-            SET
-              notification_sent = 1,
-              notification_sent_at = NOW()
+            SET notification_sent = 1,
+                notification_sent_at = NOW()
             WHERE id = ?
           `,
           [responseData.event.id],
@@ -346,17 +296,11 @@ async function recordRecognitionEvent({
         responseData.event.notification_sent = true;
 
         console.log(
-          `[TELEGRAM] Sent ${notificationResult.type} ` +
-            `for event ${responseData.event.event_code}`,
-        );
-      } else {
-        console.log(
-          "[TELEGRAM] Notification skipped:",
-          notificationResult?.reason || "unknown_reason",
+          "[TELEGRAM] Sent unknown notification:",
+          responseData.event.event_code,
         );
       }
     } catch (error) {
-      // Telegram lỗi không làm hỏng kết quả nhận diện.
       console.error("[TELEGRAM NOTIFICATION ERROR]:", error.message);
     }
   }

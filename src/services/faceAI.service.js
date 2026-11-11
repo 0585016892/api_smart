@@ -17,7 +17,6 @@ const modelBasePath = `file://${modelDirectory.replace(/\\/g, "/")}/`;
 const humanConfig = {
   backend: "tensorflow",
   modelBasePath,
-
   debug: false,
   cacheModels: false,
 
@@ -25,22 +24,17 @@ const humanConfig = {
     enabled: true,
     detector: {
       rotation: true,
-      maxDetected: 5,
+      maxDetected: 10,
       minConfidence: 0.6,
     },
-    mesh: {
-      enabled: true,
-    },
-    description: {
-      enabled: true,
-    },
+    mesh: { enabled: true },
+    description: { enabled: true },
   },
 
-  // Bật phát hiện người, kể cả khi không nhìn thấy mặt.
   body: {
     enabled: true,
     detector: {
-      maxDetected: 5,
+      maxDetected: 10,
       minConfidence: 0.5,
     },
   },
@@ -56,7 +50,6 @@ async function getHuman() {
   if (!initializationPromise) {
     initializationPromise = (async () => {
       const human = new Human(humanConfig);
-
       await human.load();
 
       humanInstance = human;
@@ -88,21 +81,38 @@ function getEmbeddingArray(embedding) {
 function validateEmbedding(embedding) {
   const values = getEmbeddingArray(embedding);
 
-  if (values.length < 64 || !values.every((value) => Number.isFinite(value))) {
+  if (values.length < 64 || !values.every(Number.isFinite)) {
     return null;
   }
 
   return values;
 }
 
-/**
- * Phân tích một frame:
- * - Phát hiện người bằng Body Detection.
- * - Phát hiện khuôn mặt bằng Face Detection.
- * - Trả embedding nếu có đúng một khuôn mặt đủ rõ.
- *
- * Không ghi database và không gửi Telegram tại đây.
- */
+function normalizeBox(box) {
+  if (!Array.isArray(box) || box.length < 4) return null;
+
+  const values = box.slice(0, 4).map(Number);
+
+  if (!values.every(Number.isFinite)) return null;
+
+  const [x, y, width, height] = values;
+
+  if (width <= 0 || height <= 0) return null;
+
+  return {
+    x,
+    y,
+    width,
+    height,
+    left: x,
+    top: y,
+    right: x + width,
+    bottom: y + height,
+    centerX: x + width / 2,
+    centerY: y + height / 2,
+  };
+}
+
 async function analyzeFrame(imageBuffer) {
   if (!Buffer.isBuffer(imageBuffer) || !imageBuffer.length) {
     throw new Error("Ảnh đầu vào không hợp lệ");
@@ -132,59 +142,77 @@ async function analyzeFrame(imageBuffer) {
 
     const result = await human.detect(imageTensor);
 
-    const bodies = result.body || [];
-    const faces = result.face || [];
+    const rawBodies = result.body || [];
+    const rawFaces = result.face || [];
 
-    // Có thể nhận diện người bằng body hoặc khuôn mặt.
+    const bodies = rawBodies
+      .map((body, index) => {
+        const box = normalizeBox(body.box);
+
+        if (!box) return null;
+
+        return {
+          index,
+          box,
+          score: Number(body.score ?? body.boxScore ?? 0),
+        };
+      })
+      .filter(Boolean);
+
+    const faces = rawFaces
+      .map((face, index) => {
+        const box = normalizeBox(face.box);
+        const score = Number(
+          face.faceScore ?? face.boxScore ?? face.score ?? 0,
+        );
+
+        const embedding =
+          score >= 0.7 ? validateEmbedding(face.embedding) : null;
+
+        return {
+          index,
+          box,
+          score: Number.isFinite(score) ? score : 0,
+          embedding,
+        };
+      })
+      .filter((face) => face.box);
+
     const personDetected = bodies.length > 0 || faces.length > 0;
+
+    const validEmbeddings = faces.filter((face) => face.embedding);
 
     const response = {
       personDetected,
+
       bodyCount: bodies.length,
       faceCount: faces.length,
-      embedding: null,
-      detectionScore: 0,
+
+      bodies,
+      faces,
+
+      // Tương thích với những nơi đang sử dụng một embedding.
+      embedding:
+        validEmbeddings.length === 1 ? validEmbeddings[0].embedding : null,
+
+      detectionScore: faces[0]?.score || bodies[0]?.score || 0,
+
       modelName: MODEL_NAME,
       imageWidth: width,
       imageHeight: height,
+
       message: "",
     };
 
     if (!personDetected) {
       response.message = "Không phát hiện người";
-      return response;
+    } else if (faces.length === 0) {
+      response.message = "Phát hiện người nhưng chưa nhìn thấy khuôn mặt";
+    } else if (validEmbeddings.length === 0) {
+      response.message = "Có khuôn mặt nhưng chưa đủ rõ để nhận diện";
+    } else {
+      response.message = `Phát hiện ${bodies.length} người và ${faces.length} khuôn mặt`;
     }
-
-    if (faces.length === 0) {
-      response.message = "Phát hiện người nhưng không nhìn thấy khuôn mặt";
-      return response;
-    }
-
-    if (faces.length > 1) {
-      response.message = "Phát hiện nhiều khuôn mặt trong ảnh";
-      return response;
-    }
-
-    const face = faces[0];
-
-    const score = Number(face.faceScore ?? face.boxScore ?? 0);
-
-    response.detectionScore = Number.isFinite(score) ? score : 0;
-
-    if (score < 0.7) {
-      response.message = "Khuôn mặt chưa đủ rõ để nhận diện";
-      return response;
-    }
-
-    const embedding = validateEmbedding(face.embedding);
-
-    if (!embedding) {
-      response.message = "Không thể trích xuất embedding khuôn mặt";
-      return response;
-    }
-
-    response.embedding = embedding;
-    response.message = "Trích xuất khuôn mặt thành công";
 
     return response;
   } finally {
@@ -194,9 +222,6 @@ async function analyzeFrame(imageBuffer) {
   }
 }
 
-/**
- * Giữ tương thích với những nơi đang gọi extractFaceEmbedding().
- */
 async function extractFaceEmbedding(imageBuffer) {
   const result = await analyzeFrame(imageBuffer);
 
@@ -208,13 +233,15 @@ async function extractFaceEmbedding(imageBuffer) {
     throw new Error("Ảnh có nhiều hơn một khuôn mặt");
   }
 
-  if (!result.embedding) {
-    throw new Error(result.message || "Không thể trích xuất khuôn mặt");
+  const face = result.faces.find((item) => item.embedding);
+
+  if (!face) {
+    throw new Error("Không thể trích xuất khuôn mặt");
   }
 
   return {
-    embedding: result.embedding,
-    detectionScore: result.detectionScore,
+    embedding: face.embedding,
+    detectionScore: face.score,
     modelName: result.modelName,
     imageWidth: result.imageWidth,
     imageHeight: result.imageHeight,
@@ -225,5 +252,6 @@ module.exports = {
   getHuman,
   analyzeFrame,
   extractFaceEmbedding,
+  validateEmbedding,
   MODEL_NAME,
 };

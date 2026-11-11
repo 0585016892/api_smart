@@ -290,6 +290,12 @@ async function testTelegramConnection() {
 
 async function writeNotificationLog(data) {
   try {
+    const allowedTypes = ["known", "unknown", "system"];
+
+    const notificationType = allowedTypes.includes(data.notification_type)
+      ? data.notification_type
+      : "system";
+
     await pool.query(
       `
         INSERT INTO notification_logs (
@@ -310,7 +316,7 @@ async function writeNotificationLog(data) {
       `,
       [
         data.event_id || null,
-        data.notification_type || "system",
+        notificationType,
         data.send_type || "message",
         String(data.recipient_chat_id),
         data.recipient_name || null,
@@ -522,7 +528,7 @@ async function sendRecognitionNotification(data = {}) {
 
       await writeNotificationLog({
         event_id: data.event_id,
-        notification_type: status,
+        notification_type: status === "uncertain" ? "unknown" : status,
         send_type: sendType,
         recipient_chat_id: chatId,
         title,
@@ -544,7 +550,7 @@ async function sendRecognitionNotification(data = {}) {
     } catch (error) {
       await writeNotificationLog({
         event_id: data.event_id,
-        notification_type: status,
+        notification_type: status === "uncertain" ? "unknown" : status,
         send_type: sendType,
         recipient_chat_id: chatId,
         title,
