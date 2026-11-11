@@ -206,11 +206,101 @@ async function deleteOldNotificationHistory(days = 180) {
     retention_days: retentionDays,
   };
 }
+async function bulkDeleteRecognitionRecords(ids, type) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    const error = new Error("Vui lòng chọn ít nhất một bản ghi");
+    error.statusCode = 400;
+    throw error;
+  }
 
+  const normalizedIds = [
+    ...new Set(ids.map((id) => parsePositiveInteger(id, "id"))),
+  ];
+
+  if (normalizedIds.length > 500) {
+    const error = new Error("Chỉ được xóa tối đa 500 bản ghi mỗi lần");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const table =
+    type === "events"
+      ? "recognition_events"
+      : type === "sessions"
+        ? "recognition_sessions"
+        : null;
+
+  if (!table) {
+    const error = new Error("Loại dữ liệu không hợp lệ");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const connection = await pool.getConnection();
+  let deletedRows = [];
+
+  try {
+    await connection.beginTransaction();
+
+    const placeholders = normalizedIds.map(() => "?").join(",");
+
+    const [rows] = await connection.query(
+      `SELECT id, snapshot_path FROM ${table}
+       WHERE id IN (${placeholders})`,
+      normalizedIds,
+    );
+
+    deletedRows = rows;
+
+    const [result] = await connection.query(
+      `DELETE FROM ${table}
+       WHERE id IN (${placeholders})`,
+      normalizedIds,
+    );
+
+    await connection.commit();
+
+    // Chỉ xóa ảnh snapshot sau khi database xóa thành công.
+    for (const row of deletedRows) {
+      const absolutePath = resolveSnapshotPath(row.snapshot_path);
+
+      if (!absolutePath) continue;
+
+      try {
+        await fs.promises.unlink(absolutePath);
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          console.error("DELETE SNAPSHOT ERROR:", error);
+        }
+      }
+    }
+
+    return {
+      requested: normalizedIds.length,
+      deleted: result.affectedRows,
+      ids: deletedRows.map((row) => row.id),
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function bulkDeleteRecognitionEvents(ids) {
+  return bulkDeleteRecognitionRecords(ids, "events");
+}
+
+async function bulkDeleteRecognitionSessions(ids) {
+  return bulkDeleteRecognitionRecords(ids, "sessions");
+}
 module.exports = {
-  getNotificationHistory,
-  getNotificationDetail,
-  getNotificationStats,
-  deleteNotificationHistory,
-  deleteOldNotificationHistory,
+  listRecognitionEvents,
+  getRecognitionEventById,
+  listRecognitionSessions,
+  getRecognitionSessionById,
+  resolveSnapshotPath,
+  bulkDeleteRecognitionEvents,
+  bulkDeleteRecognitionSessions,
 };
