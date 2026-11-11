@@ -756,15 +756,39 @@ async function bulkDeleteRecognitionRecords(ids, type) {
 // =====================================================
 
 async function bulkDeleteRecognitionEvents(ids) {
-  return bulkDeleteRecognitionRecords(ids, "events");
+  console.log("\n========== BULK DELETE EVENTS SERVICE ==========");
+  console.log("Received IDs:", ids);
+
+  try {
+    const result = await bulkDeleteRecognitionRecords(ids, "events");
+
+    console.log("DELETE EVENTS SUCCESS:", result);
+    console.log("================================================\n");
+
+    return result;
+  } catch (error) {
+    console.error("DELETE EVENTS SERVICE ERROR:", error);
+    console.log("================================================\n");
+    throw error;
+  }
 }
 
-// =====================================================
-// BULK DELETE SESSIONS
-// =====================================================
-
 async function bulkDeleteRecognitionSessions(ids) {
-  return bulkDeleteRecognitionRecords(ids, "sessions");
+  console.log("\n========== BULK DELETE SESSIONS SERVICE ==========");
+  console.log("Received IDs:", ids);
+
+  try {
+    const result = await bulkDeleteRecognitionRecords(ids, "sessions");
+
+    console.log("DELETE SESSIONS SUCCESS:", result);
+    console.log("==================================================\n");
+
+    return result;
+  } catch (error) {
+    console.error("DELETE SESSIONS SERVICE ERROR:", error);
+    console.log("==================================================\n");
+    throw error;
+  }
 }
 
 // =====================================================

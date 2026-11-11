@@ -217,22 +217,50 @@ async function getSessionDetail(req, res, next) {
  *   "ids": [1, 2, 3]
  * }
  */
+
 async function deleteBulkEvents(req, res, next) {
+  console.log("\n========== DELETE BULK EVENTS CONTROLLER ==========");
+  console.log("URL:", req.originalUrl);
+  console.log("METHOD:", req.method);
+  console.log("USER:", req.user);
+  console.log("BODY:", req.body);
+
   try {
-    const { ids } = req.body || {};
+    const result = await recognitionHistoryService.bulkDeleteRecognitionEvents(
+      req.body?.ids,
+    );
 
-    if (!Array.isArray(ids) || ids.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Vui lòng chọn ít nhất một sự kiện cần xóa",
-      });
-    }
-
-    const result =
-      await recognitionHistoryService.bulkDeleteRecognitionEvents(ids);
-
-    return sendSuccess(res, "Xóa lịch sử nhận diện thành công", result);
+    return res.status(200).json({
+      success: true,
+      message: "Xóa lịch sử nhận diện thành công",
+      data: result,
+    });
   } catch (error) {
+    console.error("DELETE BULK EVENTS CONTROLLER ERROR:", error);
+    next(error);
+  }
+}
+
+async function deleteBulkSessions(req, res, next) {
+  console.log("\n========== DELETE BULK SESSIONS CONTROLLER ==========");
+  console.log("URL:", req.originalUrl);
+  console.log("METHOD:", req.method);
+  console.log("USER:", req.user);
+  console.log("BODY:", req.body);
+
+  try {
+    const result =
+      await recognitionHistoryService.bulkDeleteRecognitionSessions(
+        req.body?.ids,
+      );
+
+    return res.status(200).json({
+      success: true,
+      message: "Xóa phiên nhận diện thành công",
+      data: result,
+    });
+  } catch (error) {
+    console.error("DELETE BULK SESSIONS CONTROLLER ERROR:", error);
     next(error);
   }
 }
