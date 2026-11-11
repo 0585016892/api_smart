@@ -146,7 +146,7 @@ app.use("/api/persons", personRoutes);
 app.use("/api/persons", faceProfileRoutes);
 
 app.use("/api/recognition", faceRecognitionRoutes);
-app.use("/api/recognition", recognitionHistoryRoutes);
+app.use("/api/recognition-history", recognitionHistoryRoutes);
 app.use("/api/recognition/stats", recognitionStatsRoutes);
 
 app.use("/api/telegram", telegramRoutes);
