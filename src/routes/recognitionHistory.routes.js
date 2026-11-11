@@ -24,4 +24,16 @@ router.get("/events/:id", getEventDetail);
 router.get("/sessions", getSessions);
 router.get("/sessions/:id", getSessionDetail);
 
+router.delete(
+  "/events/bulk",
+  authorize("admin"),
+  recognitionHistoryController.deleteBulkEvents,
+);
+
+router.delete(
+  "/sessions/bulk",
+  authorize("admin"),
+  recognitionHistoryController.deleteBulkSessions,
+);
+
 module.exports = router;

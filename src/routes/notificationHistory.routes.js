@@ -1,54 +1,27 @@
-// src/routes/recognitionHistory.routes.js
+// src/routes/notificationHistory.routes.js
 
 const express = require("express");
 const router = express.Router();
 
 const { authenticate, authorize } = require("../middleware/auth.middleware");
-const recognitionHistoryController = require("../controllers/recognitionHistory.controller");
 
-// Yêu cầu đăng nhập
+const notificationController = require("../controllers/notificationHistory.controller");
+
 router.use(authenticate);
 
-// Admin và operator được xem lịch sử
+// Admin và operator được xem lịch sử.
 router.use(authorize("admin", "operator"));
 
-// ============================================
-// XÓA NHIỀU BẢN GHI
-// Đặt trước các route có /:id
-// Chỉ admin được xóa
-// ============================================
+router.get("/", notificationController.getList);
 
-router.delete(
-  "/events/bulk",
-  authorize("admin"),
-  recognitionHistoryController.deleteBulkEvents,
-);
+// Phải đặt trước /:id để tránh route động bắt nhầm.
+router.get("/stats", notificationController.getStats);
 
-router.delete(
-  "/sessions/bulk",
-  authorize("admin"),
-  recognitionHistoryController.deleteBulkSessions,
-);
+router.get("/:id", notificationController.getDetail);
 
-// ============================================
-// LỊCH SỬ NHẬN DIỆN
-// ============================================
+// Chỉ admin được xóa lịch sử.
+router.delete("/:id", authorize("admin"), notificationController.remove);
 
-router.get("/events", recognitionHistoryController.getEvents);
-
-router.get(
-  "/events/:id/snapshot",
-  recognitionHistoryController.getEventSnapshot,
-);
-
-router.get("/events/:id", recognitionHistoryController.getEventDetail);
-
-// ============================================
-// PHIÊN VÀO / RA
-// ============================================
-
-router.get("/sessions", recognitionHistoryController.getSessions);
-
-router.get("/sessions/:id", recognitionHistoryController.getSessionDetail);
+router.post("/cleanup", authorize("admin"), notificationController.cleanup);
 
 module.exports = router;
