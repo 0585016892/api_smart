@@ -1,6 +1,5 @@
 const path = require("path");
 const fs = require("fs");
-const { pathToFileURL } = require("url");
 
 const tf = require("@tensorflow/tfjs-node");
 const Human = require("@vladmandic/human").default;
@@ -17,8 +16,7 @@ const modelDirectory = path.resolve(
   "../../node_modules/@vladmandic/human/models",
 );
 
-// Tạo file URL chuẩn cho cả Windows và Linux.
-const modelBasePath = `file://${modelDirectory.replace(/\\/g, "/")}/`;
+const modelBasePath = "file://" + modelDirectory.replace(/\\/g, "/") + "/";
 const requiredModels = [
   "blazeface.json",
   "facemesh.json",
