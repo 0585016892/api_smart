@@ -18,8 +18,7 @@ const modelDirectory = path.resolve(
 );
 
 // Tạo file URL chuẩn cho cả Windows và Linux.
-const modelBasePath = pathToFileURL(modelDirectory + path.sep).href;
-
+const modelBasePath = `file://${modelDirectory.replace(/\\/g, "/")}/`;
 const requiredModels = [
   "blazeface.json",
   "facemesh.json",
