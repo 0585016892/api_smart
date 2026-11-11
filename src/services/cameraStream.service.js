@@ -441,6 +441,10 @@ async function processFrame(worker, imageBuffer) {
     const bodies = result.bodies || [];
     const faceMatches = result.faceMatches || [];
 
+    console.log(
+      `[CAMERA ${worker.id}] AI DETECTION | Bodies: ${bodies.length} | Faces: ${faceMatches.length} | Tracks: ${worker.tracks.length}`,
+    );
+
     // Không có body và cũng không có face.
     if (!result.personDetected) {
       removeExpiredTracks(worker, now);
