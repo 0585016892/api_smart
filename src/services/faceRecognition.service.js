@@ -255,7 +255,7 @@ async function recognizeFace(imageBuffer, options = {}) {
     imageBuffer,
     result,
     cameraId: options.cameraId ?? null,
-    notifyTelegram: result.status !== "known",
+    notifyTelegram: true,
   });
 
   return { ...result, history };

@@ -145,7 +145,8 @@ async function recordRecognitionEvent({
   );
 
   const shouldNotify =
-    notifyTelegram === true && ["unknown", "uncertain"].includes(result.status);
+    notifyTelegram === true &&
+    ["known", "unknown", "uncertain"].includes(result.status);
 
   const snapshot = await saveRecognitionSnapshot(imageBuffer);
 
@@ -296,7 +297,7 @@ async function recordRecognitionEvent({
         responseData.event.notification_sent = true;
 
         console.log(
-          "[TELEGRAM] Sent unknown notification:",
+          `[TELEGRAM] Sent ${result.status} notification:`,
           responseData.event.event_code,
         );
       }

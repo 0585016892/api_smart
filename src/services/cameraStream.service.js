@@ -397,8 +397,9 @@ async function saveTrackEvent(worker, track, imageBuffer, faceCount) {
     return;
   }
 
-  // Chỉ gửi Telegram cho người lạ hoặc chưa xác định.
-  const notifyTelegram = ["unknown", "uncertain"].includes(result.status);
+  // Cả người quen và người lạ đều được thông báo.
+  // eventSaved bảo đảm mỗi tracking ID chỉ lưu/gửi một lần.
+  const notifyTelegram = true;
 
   const history = await recordRecognitionEvent({
     imageBuffer,
@@ -408,8 +409,7 @@ async function saveTrackEvent(worker, track, imageBuffer, faceCount) {
   });
 
   track.eventSaved = true;
-  track.notificationAttempted = notifyTelegram;
-
+  track.notificationAttempted = true;
   track.eventId = history?.event?.id || null;
 
   console.log(
