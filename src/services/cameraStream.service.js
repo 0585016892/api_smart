@@ -1,7 +1,6 @@
 // src/services/cameraStream.service.js
 
 const { spawn } = require("child_process");
-const path = require("path");
 const ffmpegPath = require("ffmpeg-static");
 
 const { pool } = require("../config/database");
@@ -27,7 +26,7 @@ const CAMERA_AI_INTERVAL_MS = Math.max(
   100,
 );
 
-// Mất dấu đủ 10 giây thì xem như một lượt xuất hiện mới.
+// Mất dấu đủ 10 giây thì xem như lượt xuất hiện mới.
 const PRESENCE_EXIT_GRACE_MS = Math.max(
   Number(process.env.CAMERA_PRESENCE_EXIT_SECONDS || 10) * 1000,
   5000,
@@ -35,7 +34,7 @@ const PRESENCE_EXIT_GRACE_MS = Math.max(
 
 const SESSION_TIMEOUT_MS = Math.max(
   Number(process.env.CAMERA_SESSION_TIMEOUT_MINUTES || 10) * 60 * 1000,
-  60 * 1000,
+  60000,
 );
 
 const MAX_BUFFER_SIZE = 15 * 1024 * 1024;
@@ -63,6 +62,7 @@ let serviceStarted = false;
 
 function toNumber(value, fallback = 0) {
   const number = Number(value);
+
   return Number.isFinite(number) ? number : fallback;
 }
 
@@ -90,6 +90,59 @@ function parseConfig(camera) {
     ...config,
     ...camera,
   };
+}
+
+function getCameraId(camera) {
+  return camera.id ?? camera.camera_id;
+}
+
+function getConnectionConfig(camera) {
+  return safeJsonParse(camera.connection_config, {});
+}
+
+function getCameraSourceType(camera) {
+  const config = getConnectionConfig(camera);
+
+  const protocol = String(camera.protocol || "").toLowerCase();
+
+  if (
+    config.source === "browser_webcam" ||
+    config.capture_mode === "browser" ||
+    config.source === "webcam"
+  ) {
+    return "browser_webcam";
+  }
+
+  if (protocol === "upload" || config.source === "upload") {
+    return "upload";
+  }
+
+  if (
+    protocol === "rtsp" ||
+    config.url ||
+    config.rtsp_url ||
+    config.host ||
+    camera.ip_address
+  ) {
+    return "rtsp";
+  }
+
+  if (protocol === "onvif" || protocol === "ezviz") {
+    return "unsupported";
+  }
+
+  return "unsupported";
+}
+
+function getCameraConfigSignature(camera) {
+  const config = getConnectionConfig(camera);
+
+  return JSON.stringify({
+    protocol: camera.protocol || null,
+    connection_config: config,
+    ip_address: camera.ip_address || null,
+    is_enabled: camera.is_enabled,
+  });
 }
 
 function isCameraEnabled(camera) {
@@ -121,24 +174,31 @@ function safeError(error) {
     .slice(0, 1000);
 }
 
-function getCameraId(camera) {
-  return camera.id ?? camera.camera_id;
-}
+// ======================================================
+// CAMERA RTSP CONFIG
+// ======================================================
 
 function buildRtspUrl(camera) {
-  const config = parseConfig(camera);
+  const config = getConnectionConfig(camera);
 
-  const directUrl =
-    config.rtsp_url ||
-    config.stream_url ||
-    config.url ||
-    config.main_stream_url;
+  const sourceType = getCameraSourceType(camera);
 
-  if (directUrl) {
-    return directUrl;
+  if (sourceType !== "rtsp") {
+    return null;
   }
 
-  const host = config.ip_address || config.ip || config.host || config.address;
+  // Ưu tiên URL RTSP đầy đủ.
+  const rtspUrl = config.rtsp_url || config.url;
+
+  if (rtspUrl) {
+    if (!/^rtsps?:\/\//i.test(rtspUrl)) {
+      throw new Error(`Camera ${getCameraId(camera)} có URL RTSP không hợp lệ`);
+    }
+
+    return rtspUrl;
+  }
+
+  const host = config.host || camera.ip_address;
 
   if (!host) {
     throw new Error(
@@ -147,22 +207,17 @@ function buildRtspUrl(camera) {
   }
 
   const port = config.port || 554;
-  const username = config.username || config.user || "";
+
+  const username = config.username || "";
   const password = config.password || "";
 
-  const streamPath =
-    config.stream_path || config.channel_path || config.path || "/ch1/main";
+  const streamPath = config.stream_path || "/Streaming/Channels/101";
 
-  const auth =
-    username || password
-      ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@`
-      : "";
+  const auth = username
+    ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@`
+    : "";
 
-  const normalizedPath = String(streamPath).startsWith("/")
-    ? streamPath
-    : `/${streamPath}`;
-
-  return `rtsp://${auth}${host}:${port}${normalizedPath}`;
+  return `rtsp://${auth}${host}:${port}${streamPath}`;
 }
 
 function getFfmpegArgs(rtspUrl) {
@@ -200,35 +255,13 @@ function getFfmpegArgs(rtspUrl) {
   ];
 }
 
-async function updateCameraStatus(cameraId, status, errorMessage = null) {
-  try {
-    await pool.query(
-      `
-        UPDATE cameras
-        SET status = ?
-        WHERE id = ?
-      `,
-      [status, cameraId],
-    );
-  } catch (error) {
-    // Không để lỗi cập nhật trạng thái DB làm dừng luồng camera.
-    console.error(
-      `[CAMERA ${cameraId}] Không cập nhật được trạng thái DB:`,
-      safeError(error),
-    );
-  }
-
-  if (errorMessage) {
-    console.error(`[CAMERA ${cameraId}] ${safeError(errorMessage)}`);
-  }
-}
-
 // ======================================================
 // JPEG FRAME EXTRACTION
 // ======================================================
 
 function extractJpegs(buffer) {
   const frames = [];
+
   let remaining = buffer;
 
   while (remaining.length > 0) {
@@ -250,7 +283,7 @@ function extractJpegs(buffer) {
       };
     }
 
-    const frame = remaining.subarray(0, end + 2);
+    const frame = remaining.subarray(start, end + 2);
 
     frames.push(frame);
 
@@ -369,14 +402,6 @@ function getBodyBox(body) {
   return normalizeBox(body.box || body.boundingBox || body.region || body);
 }
 
-/**
- * Tạo danh sách người từ body và face detection.
- *
- * - Mỗi body chỉ nhận tối đa một khuôn mặt.
- * - Nếu nhiều khuôn mặt nằm trong cùng một body,
- *   các khuôn mặt còn lại được tạo thành detection riêng.
- * - Khuôn mặt không nằm trong body cũng được tạo thành detection riêng.
- */
 function buildPersonDetections(bodies = [], faces = []) {
   const normalizedBodies = bodies
     .map((body, index) => ({
@@ -427,7 +452,6 @@ function buildPersonDetections(bodies = [], faces = []) {
     };
   });
 
-  // Khuôn mặt còn lại không được body nào nhận.
   normalizedFaces.forEach((face) => {
     if (assignedFaceIndexes.has(face.index)) {
       return;
@@ -486,7 +510,7 @@ function updateTrack(track, detection, now) {
 
   if (detection.face) {
     track.faceDetected = true;
-    track.faceScore = toNumber(detection.face.score, 0);
+    track.faceScore = toNumber(detection.face.score, track.faceScore);
   }
 }
 
@@ -497,6 +521,7 @@ function calculateTrackMatchScore(track, detection) {
   if (!oldBox || !newBox) return null;
 
   const iou = calculateIoU(oldBox, newBox);
+
   const distance = calculateCenterDistance(oldBox, newBox);
 
   const diagonal = Math.max(
@@ -506,8 +531,6 @@ function calculateTrackMatchScore(track, detection) {
 
   const distanceRatio = distance / diagonal;
 
-  // Face-only track chuyển sang body:
-  // Cho phép nếu tâm khuôn mặt cũ nằm trong body mới.
   if (
     track.detectionType === "face" &&
     detection.type === "body" &&
@@ -516,8 +539,6 @@ function calculateTrackMatchScore(track, detection) {
     return 0.9;
   }
 
-  // Body track chuyển sang face:
-  // Cho phép nếu tâm khuôn mặt mới nằm trong body cũ.
   if (
     track.detectionType === "body" &&
     detection.type === "face" &&
@@ -562,9 +583,13 @@ function matchBodyDetections(worker, detections, now) {
 
   candidates.forEach((candidate) => {
     if (matchedTracks.has(candidate.track.id)) return;
-    if (matchedDetections.has(candidate.detectionIndex)) return;
+
+    if (matchedDetections.has(candidate.detectionIndex)) {
+      return;
+    }
 
     matchedTracks.add(candidate.track.id);
+
     matchedDetections.add(candidate.detectionIndex);
 
     updateTrack(candidate.track, candidate.detection, now);
@@ -638,17 +663,19 @@ function buildTrackRecognitionResult(result, detection) {
       return {
         ...result,
         ...faceMatch,
+
         status: getRecognitionStatus(faceMatch) || result.status,
+
         person: faceMatch.person || result.person || null,
+
         similarity: faceMatch.similarity ?? result.similarity ?? null,
+
         faceDetected: true,
         faceCount: 1,
       };
     }
   }
 
-  // matchFace trả kết quả tổng hợp cho toàn frame.
-  // Chỉ gán kết quả tổng hợp khi frame chỉ có một khuôn mặt.
   if (toNumber(result.faceCount, 0) <= 1 && detection.face) {
     return {
       ...result,
@@ -677,8 +704,6 @@ async function saveTrackEvent(worker, track, imageBuffer) {
     return;
   }
 
-  // Đánh dấu trước khi ghi DB để tránh hai frame đồng thời
-  // tạo hai event cho cùng một track.
   track.eventSaved = true;
   track.notificationAttempted = true;
 
@@ -686,6 +711,7 @@ async function saveTrackEvent(worker, track, imageBuffer) {
     const history = await recordRecognitionEvent({
       imageBuffer,
       cameraId: worker.id,
+
       result: {
         ...result,
         status,
@@ -702,7 +728,6 @@ async function saveTrackEvent(worker, track, imageBuffer) {
       eventId: history?.event?.id || null,
     });
   } catch (error) {
-    // Nếu DB lỗi thì cho phép thử lại ở frame tiếp theo.
     track.eventSaved = false;
     track.notificationAttempted = false;
 
@@ -732,6 +757,7 @@ async function processFrame(worker, imageBuffer) {
     worker.imageHeight = toNumber(result?.imageHeight, 0) || worker.imageHeight;
 
     const bodies = result?.bodies || [];
+
     const faces = result?.faceMatches || result?.faces || [];
 
     const detections = buildPersonDetections(bodies, faces);
@@ -740,7 +766,6 @@ async function processFrame(worker, imageBuffer) {
 
     const assignments = matchBodyDetections(worker, detections, now);
 
-    // Gán kết quả nhận diện vào từng track.
     for (const assignment of assignments) {
       const { track, detection } = assignment;
 
@@ -757,6 +782,7 @@ async function processFrame(worker, imageBuffer) {
       if (!status) continue;
 
       track.latestFaceResult = trackResult;
+
       track.status = status;
 
       track.person = trackResult.person || null;
@@ -805,11 +831,18 @@ async function processFrame(worker, imageBuffer) {
 
 function createWorker(camera) {
   const config = parseConfig(camera);
+
   const id = getCameraId(camera);
 
   return {
     id,
     camera: config,
+
+    sourceType: getCameraSourceType(config),
+    configSignature: getCameraConfigSignature(config),
+
+    unsupported: false,
+    sourceError: null,
 
     process: null,
 
@@ -877,6 +910,8 @@ function stopWorker(worker) {
 function scheduleWorkerRestart(worker) {
   if (!worker || worker.stopping) return;
 
+  if (worker.unsupported) return;
+
   if (worker.restartTimer) return;
 
   worker.restartTimer = setTimeout(() => {
@@ -895,12 +930,60 @@ function scheduleWorkerRestart(worker) {
 function startWorker(worker) {
   if (!worker || worker.stopping) return;
 
-  if (worker.process) {
+  if (worker.process) return;
+
+  if (worker.unsupported) return;
+
+  const sourceType = getCameraSourceType(worker.camera);
+
+  worker.sourceType = sourceType;
+
+  // Webcam trình duyệt.
+  if (sourceType === "browser_webcam") {
+    worker.unsupported = true;
+    worker.processing = false;
+    worker.connected = false;
+
+    worker.sourceError =
+      "Webcam trình duyệt cần gửi frame từ frontend lên backend";
+
+    console.log(
+      `[CAMERA ${worker.id}] BROWSER WEBCAM - CHỜ FRONTEND GỬI FRAME`,
+    );
+
+    return;
+  }
+
+  // Camera upload.
+  if (sourceType === "upload") {
+    worker.unsupported = true;
+    worker.processing = false;
+    worker.connected = false;
+
+    worker.sourceError = "Camera upload không sử dụng RTSP";
+
+    console.log(`[CAMERA ${worker.id}] UPLOAD SOURCE - BỎ QUA RTSP`);
+
+    return;
+  }
+
+  if (sourceType !== "rtsp") {
+    worker.unsupported = true;
+    worker.processing = false;
+    worker.connected = false;
+
+    worker.sourceError = "Camera chưa có cấu hình RTSP được hỗ trợ";
+
+    console.error(`[CAMERA ${worker.id}] UNSUPPORTED CAMERA SOURCE`);
+
     return;
   }
 
   if (!ffmpegPath) {
-    console.error("[CAMERA] Không tìm thấy ffmpeg-static");
+    worker.sourceError = "Không tìm thấy ffmpeg-static";
+
+    console.error(`[CAMERA ${worker.id}] FFMPEG NOT FOUND`);
+
     return;
   }
 
@@ -908,11 +991,23 @@ function startWorker(worker) {
 
   try {
     rtspUrl = buildRtspUrl(worker.camera);
+
+    if (!rtspUrl) {
+      throw new Error("RTSP URL rỗng");
+    }
   } catch (error) {
-    console.error(`[CAMERA ${worker.id}] RTSP CONFIG ERROR:`, safeError(error));
+    worker.sourceError = safeError(error);
+
+    console.error(
+      `[CAMERA ${worker.id}] RTSP CONFIG ERROR:`,
+      worker.sourceError,
+    );
 
     return;
   }
+
+  worker.unsupported = false;
+  worker.sourceError = null;
 
   const args = getFfmpegArgs(rtspUrl);
 
@@ -987,9 +1082,11 @@ function startWorker(worker) {
   });
 
   ffmpeg.on("error", (error) => {
+    worker.sourceError = safeError(error);
+
     console.error(
       `[CAMERA ${worker.id}] FFMPEG SPAWN ERROR:`,
-      safeError(error),
+      worker.sourceError,
     );
   });
 
@@ -1020,8 +1117,6 @@ async function syncCameras() {
   syncing = true;
 
   try {
-    // Lấy toàn bộ camera để không phụ thuộc cứng vào tên
-    // cột enabled/is_enabled trong câu truy vấn.
     const [rows] = await pool.query("SELECT * FROM cameras");
 
     const cameras = (rows || []).filter(isCameraEnabled);
@@ -1030,7 +1125,7 @@ async function syncCameras() {
       cameras.map((camera) => String(getCameraId(camera))),
     );
 
-    // Dừng camera đã bị xóa hoặc tắt.
+    // Dừng camera bị xóa hoặc tắt.
     for (const [id, worker] of workers.entries()) {
       if (!activeIds.has(String(id))) {
         console.log(`[CAMERA ${id}] CAMERA DISABLED`);
@@ -1040,25 +1135,51 @@ async function syncCameras() {
       }
     }
 
-    // Khởi chạy camera mới.
+    // Đồng bộ camera.
     for (const camera of cameras) {
       const id = getCameraId(camera);
 
       if (id === undefined || id === null) continue;
 
+      const config = parseConfig(camera);
+
+      const sourceType = getCameraSourceType(config);
+
+      const signature = getCameraConfigSignature(config);
+
       const existingWorker = workers.get(id);
 
       if (existingWorker) {
-        existingWorker.camera = parseConfig(camera);
+        const configChanged = existingWorker.configSignature !== signature;
 
-        if (!existingWorker.process && !existingWorker.stopping) {
+        const sourceChanged = existingWorker.sourceType !== sourceType;
+
+        existingWorker.camera = config;
+
+        if (configChanged || sourceChanged) {
+          console.log(`[CAMERA ${id}] CONFIG CHANGED - RESTART WORKER`);
+
+          stopWorker(existingWorker);
+
+          existingWorker.stopping = false;
+          existingWorker.unsupported = false;
+          existingWorker.sourceError = null;
+          existingWorker.sourceType = sourceType;
+          existingWorker.configSignature = signature;
+
+          startWorker(existingWorker);
+        } else if (
+          !existingWorker.process &&
+          !existingWorker.stopping &&
+          !existingWorker.unsupported
+        ) {
           startWorker(existingWorker);
         }
 
         continue;
       }
 
-      const worker = createWorker(camera);
+      const worker = createWorker(config);
 
       workers.set(id, worker);
 
@@ -1076,9 +1197,7 @@ async function syncCameras() {
 // ======================================================
 
 async function startCameraStreamService() {
-  if (serviceStarted) {
-    return;
-  }
+  if (serviceStarted) return;
 
   serviceStarted = true;
 
@@ -1134,7 +1253,15 @@ function getCameraStreamStatus() {
       camera_id: id,
 
       camera_name:
-        worker.camera.name || worker.camera.camera_name || `Camera ${id}`,
+        worker.camera.camera_name || worker.camera.name || `Camera ${id}`,
+
+      protocol: worker.camera.protocol || null,
+
+      source_type: worker.sourceType,
+
+      unsupported: worker.unsupported,
+
+      source_error: worker.sourceError,
 
       connected: worker.connected,
 
@@ -1167,6 +1294,8 @@ function getCameraStreamStatus() {
       image_width: worker.imageWidth,
 
       image_height: worker.imageHeight,
+
+      last_ai_error: worker.lastAiError,
 
       tracks: tracks.map((track) => ({
         tracking_id: track.id,
@@ -1213,9 +1342,11 @@ function getCameraStreamStatus() {
 // ======================================================
 
 function getCameraLatestFrame(cameraId) {
-  const worker = workers.get(
-    isNaN(Number(cameraId)) ? cameraId : Number(cameraId),
-  );
+  const numericId = Number(cameraId);
+
+  const key = Number.isNaN(numericId) ? cameraId : numericId;
+
+  const worker = workers.get(key);
 
   if (!worker || !worker.latestFrame) {
     return null;
