@@ -142,58 +142,11 @@ async function updateRecognitionSession(connection, data) {
 }
 
 /**
- * Gửi Telegram sau khi đã COMMIT sự kiện.
+ * Ghi nhận một sự kiện nhận diện.
  *
- * Telegram lỗi không ảnh hưởng đến kết quả nhận diện.
- */
-async function sendEventNotification(eventData) {
-  if (!["known", "unknown"].includes(eventData.recognition_status)) {
-    return false;
-  }
-
-  try {
-    const result = await telegramService.sendRecognitionNotification({
-      recognition_status: eventData.recognition_status,
-      event_code: eventData.event_code,
-      person_name: eventData.person_name,
-      camera_name: eventData.camera_name,
-      confidence: eventData.confidence,
-    });
-
-    if (!result || !result.sent) {
-      console.log(
-        "[TELEGRAM] Notification skipped:",
-        result?.reason || "unknown_reason",
-      );
-
-      return false;
-    }
-
-    await pool.query(
-      `
-        UPDATE recognition_events
-        SET
-          notification_sent = 1,
-          notification_sent_at = NOW()
-        WHERE id = ?
-      `,
-      [eventData.id],
-    );
-
-    console.log(
-      `[TELEGRAM] Notification sent for event ${eventData.event_code}`,
-    );
-
-    return true;
-  } catch (error) {
-    console.error("[TELEGRAM NOTIFICATION ERROR]:", error.message);
-
-    return false;
-  }
-}
-
-/**
- * Ghi nhận một lần nhận diện vào recognition_events.
+ * Lưu ý:
+ * Hàm này chỉ được gọi một lần cho mỗi lượt xuất hiện
+ * từ cameraStream.service.js.
  */
 async function recordRecognitionEvent({
   imageBuffer,
@@ -214,6 +167,14 @@ async function recordRecognitionEvent({
   const confidence = Number.isFinite(Number(result.similarity))
     ? Math.max(0, Math.min(1, Number(result.similarity)))
     : null;
+
+  const faceCount = Math.max(
+    0,
+    Math.min(
+      20,
+      Number(result.faceCount ?? (result.faceDetected ? 1 : 0)) || 0,
+    ),
+  );
 
   // Lưu snapshot trước khi ghi database.
   const snapshot = await saveRecognitionSnapshot(imageBuffer);
@@ -292,7 +253,7 @@ async function recordRecognitionEvent({
           notification_sent,
           event_at
         )
-        VALUES (?, ?, ?, ?, 'unknown', ?, ?, 1, 0, NOW())
+        VALUES (?, ?, ?, ?, 'unknown', ?, ?, ?, 0, NOW())
       `,
       [
         eventCode,
@@ -301,6 +262,7 @@ async function recordRecognitionEvent({
         result.status,
         confidence,
         snapshot.relativePath,
+        faceCount,
       ],
     );
 
@@ -314,7 +276,6 @@ async function recordRecognitionEvent({
       });
     }
 
-    // Hoàn thành transaction trước khi gửi Telegram.
     await connection.commit();
 
     committed = true;
@@ -329,6 +290,7 @@ async function recordRecognitionEvent({
         direction: "unknown",
         confidence,
         snapshot_path: snapshot.relativePath,
+        face_count: faceCount,
         notification_sent: false,
       },
       session,
@@ -348,13 +310,12 @@ async function recordRecognitionEvent({
       connection.release();
     }
 
-    // Chỉ xóa snapshot nếu transaction chưa COMMIT.
     if (!committed) {
       await deleteRecognitionSnapshot(snapshot.relativePath);
     }
   }
 
-  // Gửi thông báo sau khi database đã COMMIT và connection đã release.
+  // Chỉ gửi Telegram sau khi database đã COMMIT.
   if (committed) {
     try {
       const notificationResult =
@@ -385,7 +346,8 @@ async function recordRecognitionEvent({
         responseData.event.notification_sent = true;
 
         console.log(
-          `[TELEGRAM] Sent ${notificationResult.type} for event ${responseData.event.event_code}`,
+          `[TELEGRAM] Sent ${notificationResult.type} ` +
+            `for event ${responseData.event.event_code}`,
         );
       } else {
         console.log(
@@ -394,7 +356,7 @@ async function recordRecognitionEvent({
         );
       }
     } catch (error) {
-      // Telegram lỗi không được làm hỏng kết quả nhận diện.
+      // Telegram lỗi không làm hỏng kết quả nhận diện.
       console.error("[TELEGRAM NOTIFICATION ERROR]:", error.message);
     }
   }

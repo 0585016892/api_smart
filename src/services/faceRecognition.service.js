@@ -1,5 +1,5 @@
 const { pool } = require("../config/database");
-const { getHuman, extractFaceEmbedding } = require("./faceAI.service");
+const { getHuman, analyzeFrame } = require("./faceAI.service");
 const { recordRecognitionEvent } = require("./recognitionEvent.service");
 
 const MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD || 0.65);
@@ -24,10 +24,38 @@ function parseEmbedding(value) {
 }
 
 /**
- * Chỉ phân tích khuôn mặt, không tự động ghi sự kiện.
+ * Phân tích frame và nhận diện người.
  */
 async function matchFace(imageBuffer) {
-  const detected = await extractFaceEmbedding(imageBuffer);
+  const detected = await analyzeFrame(imageBuffer);
+
+  if (!detected.personDetected) {
+    return {
+      status: "no_person",
+      personDetected: false,
+      faceDetected: false,
+      faceCount: 0,
+      message: "Không phát hiện người",
+      similarity: 0,
+      person: null,
+      candidates: [],
+    };
+  }
+
+  // Có người nhưng không có khuôn mặt hoặc mặt không đủ rõ.
+  if (!detected.embedding) {
+    return {
+      status: "unknown",
+      personDetected: true,
+      faceDetected: detected.faceCount > 0,
+      faceCount: detected.faceCount,
+      message: detected.message,
+      similarity: 0,
+      detectionScore: detected.detectionScore,
+      person: null,
+      candidates: [],
+    };
+  }
 
   const [rows] = await pool.query(`
     SELECT
@@ -48,8 +76,12 @@ async function matchFace(imageBuffer) {
   if (!rows.length) {
     return {
       status: "unknown",
+      personDetected: true,
+      faceDetected: true,
+      faceCount: detected.faceCount,
       message: "Chưa có dữ liệu khuôn mặt để đối chiếu",
       similarity: 0,
+      detectionScore: detected.detectionScore,
       person: null,
       candidates: [],
     };
@@ -96,8 +128,12 @@ async function matchFace(imageBuffer) {
   if (!ranked.length) {
     return {
       status: "unknown",
+      personDetected: true,
+      faceDetected: true,
+      faceCount: detected.faceCount,
       message: "Không có mẫu khuôn mặt hợp lệ để đối chiếu",
       similarity: 0,
+      detectionScore: detected.detectionScore,
       person: null,
       candidates: [],
     };
@@ -118,8 +154,13 @@ async function matchFace(imageBuffer) {
 
   return {
     status,
+    personDetected: true,
+    faceDetected: true,
+    faceCount: detected.faceCount,
     message,
     similarity: Number(bestMatch.similarity.toFixed(4)),
+    detectionScore: detected.detectionScore,
+
     person:
       status === "unknown"
         ? null
@@ -129,6 +170,7 @@ async function matchFace(imageBuffer) {
             full_name: bestMatch.full_name,
             category: bestMatch.category,
           },
+
     candidates: ranked.slice(0, 3).map((item) => ({
       person_id: item.person_id,
       person_code: item.person_code,
@@ -139,15 +181,12 @@ async function matchFace(imageBuffer) {
 }
 
 /**
- * Giữ tương thích API cũ:
- * mặc định vẫn phân tích và lưu sự kiện như trước.
- *
- * Truyền { persist: false } nếu chỉ muốn lấy kết quả AI.
+ * Giữ tương thích API cũ.
  */
 async function recognizeFace(imageBuffer, options = {}) {
   const result = await matchFace(imageBuffer);
 
-  if (options.persist === false) {
+  if (options.persist === false || result.status === "no_person") {
     return result;
   }
 

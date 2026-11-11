@@ -5,26 +5,22 @@ const { recordRecognitionEvent } = require("./recognitionEvent.service");
 const ffmpeg = require("ffmpeg-static");
 
 const SYNC_INTERVAL = 5000;
+
 const FRAME_INTERVAL = Math.max(
   Number(process.env.CAMERA_FRAME_INTERVAL_SECONDS || 2),
   1,
 );
 
-const EVENT_COOLDOWN = Math.max(
-  Number(process.env.FACE_EVENT_COOLDOWN_MS || 60000),
-  10000,
-);
-
-const UNKNOWN_COOLDOWN = Math.max(
-  Number(process.env.FACE_UNKNOWN_COOLDOWN_MS || 120000),
-  10000,
+// Camera phải không phát hiện người liên tục đủ thời gian mới kết thúc lượt.
+const PRESENCE_EXIT_GRACE_MS = Math.max(
+  Number(process.env.CAMERA_PRESENCE_EXIT_SECONDS || 10) * 1000,
+  5000,
 );
 
 const ERROR_LOG_INTERVAL = 30000;
 const MAX_BUFFER_SIZE = 15 * 1024 * 1024;
 
 const workers = new Map();
-const lastEvents = new Map();
 
 let syncTimer = null;
 let syncing = false;
@@ -65,13 +61,8 @@ function buildRtspUrl(config) {
     `rtsp://${config.host}:${Number(config.port || 554)}${config.stream_path || "/"}`,
   );
 
-  if (config.username) {
-    url.username = config.username;
-  }
-
-  if (config.password) {
-    url.password = config.password;
-  }
+  if (config.username) url.username = config.username;
+  if (config.password) url.password = config.password;
 
   return url.toString();
 }
@@ -117,7 +108,7 @@ async function updateCameraStatus(id, status, error = null) {
 }
 
 /**
- * Tách các frame JPEG từ luồng image2pipe.
+ * Tách các frame JPEG từ image2pipe.
  */
 function extractJpegs(buffer) {
   const frames = [];
@@ -137,9 +128,7 @@ function extractJpegs(buffer) {
 
     const end = remaining.indexOf(Buffer.from([0xff, 0xd9]), 2);
 
-    if (end === -1) {
-      break;
-    }
+    if (end === -1) break;
 
     frames.push(remaining.subarray(0, end + 2));
     remaining = remaining.subarray(end + 2);
@@ -151,31 +140,13 @@ function extractJpegs(buffer) {
   };
 }
 
-function getEventIdentity(result) {
-  if (result.status === "known" && result.person?.id) {
-    return `known:${result.person.id}`;
-  }
-
-  if (result.status === "uncertain") {
-    const candidate = result.candidates?.[0];
-
-    return `uncertain:${candidate?.person_id || "unknown"}`;
-  }
-
-  return "unknown";
-}
-
 function logFrameError(worker, error) {
   const now = Date.now();
 
-  if (now - worker.lastErrorLogAt < ERROR_LOG_INTERVAL) {
-    return;
-  }
+  if (now - worker.lastErrorLogAt < ERROR_LOG_INTERVAL) return;
 
   worker.lastErrorLogAt = now;
 
-  // Ghi stack đầy đủ để tìm đúng package gây lỗi.
-  // Không ghi URL RTSP hoặc thông tin đăng nhập.
   const stack = error?.stack || error?.message || error;
 
   console.error(`[CAMERA ${worker.id}] Lỗi xử lý frame:\n`, safeError(stack));
@@ -184,10 +155,7 @@ function logFrameError(worker, error) {
 function logFrameStatus(worker, message) {
   const now = Date.now();
 
-  // Mỗi camera chỉ log trạng thái tối đa 10 giây/lần.
-  if (now - (worker.lastStatusLogAt || 0) < 10000) {
-    return;
-  }
+  if (now - (worker.lastStatusLogAt || 0) < 10000) return;
 
   worker.lastStatusLogAt = now;
 
@@ -198,6 +166,37 @@ function logFrameStatus(worker, message) {
   );
 }
 
+/**
+ * Đóng một lượt xuất hiện khi camera không còn phát hiện người.
+ */
+function updatePersonAbsence(worker) {
+  if (!worker.presenceActive || !worker.lastPersonSeenAt) {
+    return;
+  }
+
+  const now = Date.now();
+  const absentDuration = now - worker.lastPersonSeenAt;
+
+  if (absentDuration < PRESENCE_EXIT_GRACE_MS) {
+    return;
+  }
+
+  worker.presenceActive = false;
+  worker.presenceEventSaved = false;
+  worker.lastPersonSeenAt = 0;
+
+  console.log(
+    `[CAMERA ${worker.id}] Người đã rời khỏi camera. ` +
+      `Đã kết thúc lượt xuất hiện.`,
+  );
+}
+
+/**
+ * Xử lý một frame:
+ * - Không có người: cập nhật thời gian vắng mặt.
+ * - Có người: mở hoặc duy trì lượt xuất hiện.
+ * - Mỗi lượt chỉ ghi một sự kiện.
+ */
 async function processFrame(worker, imageBuffer) {
   if (worker.processing || worker.stopping || stopping) {
     return;
@@ -213,65 +212,67 @@ async function processFrame(worker, imageBuffer) {
       throw new Error("Face AI không trả về kết quả hợp lệ");
     }
 
-    if (worker.stopping || stopping) {
-      return;
-    }
+    if (worker.stopping || stopping) return;
 
-    const identity = getEventIdentity(result);
-    const eventKey = `${worker.id}:${identity}`;
     const now = Date.now();
 
-    // Log kết quả nhận diện tối đa 10 giây/lần.
-    logFrameStatus(
-      worker,
-      `AI RESULT: ${String(result.status).toUpperCase()} - ${
-        result.person?.full_name || result.message || "Chưa xác định danh tính"
-      }`,
-    );
+    // Không phát hiện người trong frame.
+    if (result.status === "no_person" || !result.personDetected) {
+      updatePersonAbsence(worker);
 
-    const cooldown =
-      result.status === "unknown" ? UNKNOWN_COOLDOWN : EVENT_COOLDOWN;
+      logFrameStatus(
+        worker,
+        worker.presenceActive
+          ? "Không phát hiện người trong frame, đang chờ xác nhận rời đi"
+          : "Đang hoạt động, chưa phát hiện người",
+      );
 
-    const lastTime = lastEvents.get(eventKey) || 0;
-
-    if (now - lastTime < cooldown) {
       return;
     }
 
-    // Đánh dấu trước khi ghi DB để tránh ghi trùng.
-    lastEvents.set(eventKey, now);
+    // Có người: cập nhật thời điểm nhìn thấy gần nhất.
+    worker.lastPersonSeenAt = now;
 
-    try {
-      await recordRecognitionEvent({
-        imageBuffer,
-        result,
-        cameraId: worker.id,
-      });
+    // Mở lượt xuất hiện mới.
+    if (!worker.presenceActive) {
+      worker.presenceActive = true;
+      worker.presenceEventSaved = false;
 
       console.log(
-        `[CAMERA ${worker.id}] EVENT SAVED:`,
-        String(result.status).toUpperCase(),
-        result.person?.full_name || result.message || "Không xác định",
-        result.similarity != null ? `(${result.similarity})` : "",
+        `[CAMERA ${worker.id}] PHÁT HIỆN NGƯỜI - BẮT ĐẦU LƯỢT XUẤT HIỆN`,
       );
-    } catch (error) {
-      lastEvents.delete(eventKey);
-      throw error;
     }
+
+    logFrameStatus(
+      worker,
+      `AI RESULT: ${String(result.status).toUpperCase()} - ` +
+        `${result.person?.full_name || result.message || "Chưa xác định danh tính"}`,
+    );
+
+    // Đã ghi sự kiện cho lượt xuất hiện hiện tại thì không ghi lại.
+    if (worker.presenceEventSaved) {
+      return;
+    }
+
+    // Đánh dấu sau khi lưu thành công.
+    // Nếu DB lỗi, frame kế tiếp vẫn có thể thử ghi lại.
+    await recordRecognitionEvent({
+      imageBuffer,
+      result,
+      cameraId: worker.id,
+    });
+
+    worker.presenceEventSaved = true;
+
+    console.log(
+      `[CAMERA ${worker.id}] EVENT SAVED:`,
+      String(result.status).toUpperCase(),
+      result.person?.full_name || result.message || "Không xác định",
+      result.similarity != null ? `(${result.similarity})` : "",
+      `| Face count: ${result.faceCount || 0}`,
+    );
   } catch (error) {
-    const message = String(error?.message || "").toLowerCase();
-
-    const isNormalNoFace =
-      message.includes("no face") ||
-      message.includes("không phát hiện") ||
-      message.includes("không tìm thấy khuôn mặt") ||
-      message.includes("no valid face");
-
-    if (isNormalNoFace) {
-      logFrameStatus(worker, "Đang hoạt động, chưa phát hiện khuôn mặt");
-    } else {
-      logFrameError(worker, error);
-    }
+    logFrameError(worker, error);
   } finally {
     worker.processing = false;
   }
@@ -291,7 +292,9 @@ function startWorker(camera) {
     rtspUrl = buildRtspUrl(config);
   } catch (error) {
     updateCameraStatus(id, "error", getErrorMessage(error));
+
     console.error(`[CAMERA ${id}]`, getErrorMessage(error));
+
     return;
   }
 
@@ -302,11 +305,17 @@ function startWorker(camera) {
     processing: false,
     connected: false,
     stopping: false,
+
     lastErrorLogAt: 0,
+    lastStatusLogAt: 0,
 
     framesReceived: 0,
     framesProcessed: 0,
-    lastStatusLogAt: 0,
+
+    // Trạng thái chống gửi sự kiện liên tục.
+    presenceActive: false,
+    presenceEventSaved: false,
+    lastPersonSeenAt: 0,
 
     signature: JSON.stringify({
       protocol: camera.protocol,
@@ -327,7 +336,6 @@ function startWorker(camera) {
     "-rtsp_transport",
     "tcp",
 
-    // Timeout RTSP, đơn vị micro giây.
     "-timeout",
     "10000000",
 
@@ -362,6 +370,7 @@ function startWorker(camera) {
     worker.process = child;
   } catch (error) {
     workers.delete(id);
+
     updateCameraStatus(id, "error", getErrorMessage(error));
 
     console.error(
@@ -386,6 +395,7 @@ function startWorker(camera) {
 
       if (worker.buffer.length > MAX_BUFFER_SIZE) {
         worker.buffer = Buffer.alloc(0);
+
         console.error(
           `[CAMERA ${id}] Buffer vượt giới hạn, đã giải phóng bộ nhớ`,
         );
@@ -453,8 +463,6 @@ function startWorker(camera) {
     await updateCameraStatus(id, "error", detail);
 
     console.error(`[CAMERA ${id}] RTSP DISCONNECTED:`, detail);
-
-    // Worker sẽ được syncCameras khởi động lại.
   });
 }
 
@@ -492,11 +500,6 @@ async function stopWorker(id) {
 
 /**
  * Đồng bộ camera từ MySQL.
- *
- * - Tự chạy camera RTSP đang bật.
- * - Tự dừng camera bị tắt.
- * - Tự khởi động lại nếu cấu hình thay đổi.
- * - Tự khởi động lại khi FFmpeg bị chết.
  */
 async function syncCameras() {
   if (syncing || stopping) return;
@@ -517,14 +520,12 @@ async function syncCameras() {
 
     const enabledIds = new Set(cameras.map((camera) => Number(camera.id)));
 
-    // Dừng worker không còn được bật.
     for (const [id] of workers) {
       if (!enabledIds.has(id)) {
         await stopWorker(id);
       }
     }
 
-    // Khởi động hoặc cập nhật worker.
     for (const camera of cameras) {
       const id = Number(camera.id);
       const config = parseConfig(camera.connection_config);
@@ -548,15 +549,6 @@ async function syncCameras() {
         startWorker(camera);
       }
     }
-
-    // Xóa lịch sử cooldown cũ để tránh Map tăng mãi.
-    const now = Date.now();
-
-    for (const [key, timestamp] of lastEvents) {
-      if (now - timestamp > 24 * 60 * 60 * 1000) {
-        lastEvents.delete(key);
-      }
-    }
   } catch (error) {
     console.error("[CAMERA STREAM] Sync error:", getErrorMessage(error));
   } finally {
@@ -571,10 +563,8 @@ async function startCameraStreamService() {
 
   console.log("[CAMERA STREAM] Service starting...");
 
-  // Chờ lần đồng bộ đầu tiên hoàn thành.
   await syncCameras();
 
-  // Tránh tạo timer nếu service đã được yêu cầu dừng.
   if (stopping) return;
 
   syncTimer = setInterval(syncCameras, SYNC_INTERVAL);
@@ -603,6 +593,11 @@ function getCameraStreamStatus() {
     connected: worker.connected,
     processing: worker.processing,
     running: Boolean(worker.process && worker.process.exitCode === null),
+    person_present: worker.presenceActive,
+    event_saved: worker.presenceEventSaved,
+    last_person_seen_at: worker.lastPersonSeenAt
+      ? new Date(worker.lastPersonSeenAt).toISOString()
+      : null,
   }));
 }
 
