@@ -9,6 +9,9 @@ router.use(authenticate);
 // Giám sát AI trực tiếp
 // Phải đặt trước /:id
 router.get("/live-status", cameraController.getLiveStatus);
+
+router.get("/:id/live-snapshot", cameraController.getLiveSnapshot);
+
 router.get("/:id/live-frame", cameraController.getLiveFrame);
 router.get("/:id/live-stream", cameraController.getLiveStream);
 

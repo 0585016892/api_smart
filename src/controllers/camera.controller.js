@@ -266,3 +266,49 @@ exports.getLiveStream = async (req, res, next) => {
     }
   }
 };
+// =========================================================
+// LIVE CAMERA SNAPSHOT - FRAME + TRACKS ĐỒNG BỘ
+// =========================================================
+
+exports.getLiveSnapshot = async (req, res, next) => {
+  try {
+    const id = validateId(req.params.id);
+
+    const snapshot = cameraStreamService.getCameraLiveSnapshot(id);
+
+    if (!snapshot) {
+      return res.status(503).json({
+        success: false,
+        message: "Camera chưa có snapshot AI hoặc chưa kết nối",
+      });
+    }
+
+    res.set({
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      Pragma: "no-cache",
+      Expires: "0",
+    });
+
+    return res.json({
+      success: true,
+      message: "Lấy LIVE snapshot thành công",
+
+      data: {
+        frame_id: snapshot.frameId,
+        captured_at: snapshot.capturedAt,
+        processed_at: snapshot.processedAt,
+
+        image_width: snapshot.imageWidth,
+        image_height: snapshot.imageHeight,
+
+        person_count: snapshot.personCount,
+        tracks: snapshot.tracks,
+
+        // JPEG được mã hóa Base64 để truyền cùng tracks.
+        frame: snapshot.frame.toString("base64"),
+      },
+    });
+  } catch (error) {
+    handleError(error, next);
+  }
+};

@@ -633,6 +633,68 @@ function removeExpiredTracks(worker, now) {
 }
 
 // ======================================================
+// LIVE SNAPSHOT HELPERS
+// ======================================================
+
+function serializeTrack(track) {
+  return {
+    tracking_id: track.id,
+    status: track.status,
+    person: track.person,
+    similarity: track.similarity,
+    face_detected: track.faceDetected,
+    face_score: track.faceScore,
+    event_saved: track.eventSaved,
+
+    box: track.box
+      ? {
+          left: track.box.left,
+          top: track.box.top,
+          right: track.box.right,
+          bottom: track.box.bottom,
+          width: track.box.width,
+          height: track.box.height,
+          centerX: track.box.centerX,
+          centerY: track.box.centerY,
+        }
+      : null,
+
+    first_seen_at: track.firstSeenAt
+      ? new Date(track.firstSeenAt).toISOString()
+      : null,
+
+    last_seen_at: track.lastSeenAt
+      ? new Date(track.lastSeenAt).toISOString()
+      : null,
+  };
+}
+
+/**
+ * Lưu ảnh và tracks của cùng một frame.
+ * Chỉ lấy tracks thực sự được phát hiện trong frame hiện tại,
+ * không vẽ lại những người đã mất dấu từ các frame trước.
+ */
+function updateLiveSnapshot(worker, imageBuffer, capturedAt, detectedAt) {
+  worker.frameSequence += 1;
+
+  const tracks = [...worker.tracks.values()]
+    .filter((track) => track.lastSeenAt === detectedAt)
+    .map(serializeTrack);
+
+  worker.latestSnapshot = {
+    frameId: worker.frameSequence,
+    capturedAt,
+    processedAt: detectedAt,
+
+    imageWidth: worker.imageWidth,
+    imageHeight: worker.imageHeight,
+
+    frame: imageBuffer,
+    tracks,
+    personCount: tracks.length,
+  };
+}
+// ======================================================
 // FACE RESULT ASSOCIATION
 // ======================================================
 
@@ -739,7 +801,7 @@ async function saveTrackEvent(worker, track, imageBuffer) {
 // PROCESS AI FRAME
 // ======================================================
 
-async function processFrame(worker, imageBuffer) {
+async function processFrame(worker, imageBuffer, capturedAt = Date.now()) {
   if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
     return;
   }
@@ -757,7 +819,6 @@ async function processFrame(worker, imageBuffer) {
     worker.imageHeight = toNumber(result?.imageHeight, 0) || worker.imageHeight;
 
     const bodies = result?.bodies || [];
-
     const faces = result?.faceMatches || result?.faces || [];
 
     const detections = buildPersonDetections(bodies, faces);
@@ -782,13 +843,9 @@ async function processFrame(worker, imageBuffer) {
       if (!status) continue;
 
       track.latestFaceResult = trackResult;
-
       track.status = status;
-
       track.person = trackResult.person || null;
-
       track.similarity = trackResult.similarity ?? null;
-
       track.faceDetected = true;
 
       track.faceScore = toNumber(detection.face.score, track.faceScore);
@@ -803,6 +860,9 @@ async function processFrame(worker, imageBuffer) {
     if (detections.length > 0) {
       worker.lastPersonDetectedAt = now;
     }
+
+    // Ảnh + tracks được lưu cùng một snapshot.
+    updateLiveSnapshot(worker, imageBuffer, capturedAt, now);
 
     if (now - worker.lastLogAt >= 5000) {
       console.log(
@@ -874,6 +934,9 @@ function createWorker(camera) {
     lastRestartAt: 0,
     restartTimer: null,
 
+    latestSnapshot: null,
+    frameSequence: 0,
+
     frameQueueBusy: false,
     lastFrameProcessAt: 0,
   };
@@ -902,6 +965,12 @@ function stopWorker(worker) {
   worker.connected = false;
   worker.processing = false;
   worker.buffer = Buffer.alloc(0);
+
+  worker.latestFrame = null;
+  worker.latestFrameAt = null;
+  worker.latestSnapshot = null;
+  worker.imageWidth = 0;
+  worker.imageHeight = 0;
 
   worker.tracks.clear();
   worker.personCount = 0;
@@ -1039,8 +1108,11 @@ function startWorker(worker) {
     worker.buffer = extracted.remaining;
 
     for (const frame of extracted.frames) {
+      const capturedAt = Date.now();
+
+      // Frame thô mới nhất, phục vụ API cũ.
       worker.latestFrame = frame;
-      worker.latestFrameAt = Date.now();
+      worker.latestFrameAt = capturedAt;
 
       const now = Date.now();
 
@@ -1054,7 +1126,7 @@ function startWorker(worker) {
       worker.frameQueueBusy = true;
       worker.lastFrameProcessAt = now;
 
-      processFrame(worker, frame)
+      processFrame(worker, frame, capturedAt)
         .catch((error) => {
           console.error(
             `[CAMERA ${worker.id}] PROCESS FRAME ERROR:`,
@@ -1335,6 +1407,37 @@ function getCameraStreamStatus() {
       })),
     };
   });
+} // ======================================================
+// LATEST LIVE SNAPSHOT - FRAME + TRACKS
+// ======================================================
+
+function getCameraLiveSnapshot(cameraId) {
+  const numericId = Number(cameraId);
+
+  const key = Number.isNaN(numericId) ? cameraId : numericId;
+
+  const worker = workers.get(key);
+
+  if (!worker || !worker.latestSnapshot) {
+    return null;
+  }
+
+  const snapshot = worker.latestSnapshot;
+
+  return {
+    frameId: snapshot.frameId,
+    capturedAt: snapshot.capturedAt,
+    processedAt: snapshot.processedAt,
+
+    imageWidth: snapshot.imageWidth,
+    imageHeight: snapshot.imageHeight,
+
+    personCount: snapshot.personCount,
+    tracks: snapshot.tracks,
+
+    // Trả Buffer để controller tự quyết định cách truyền.
+    frame: snapshot.frame,
+  };
 }
 
 // ======================================================
@@ -1372,4 +1475,5 @@ module.exports = {
 
   getCameraStreamStatus,
   getCameraLatestFrame,
+  getCameraLiveSnapshot,
 };
