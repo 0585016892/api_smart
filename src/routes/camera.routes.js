@@ -6,7 +6,13 @@ const { authenticate, authorize } = require("../middleware/auth.middleware");
 
 router.use(authenticate);
 
-// Danh sách và chi tiết: mọi vai trò đã đăng nhập
+// Giám sát AI trực tiếp
+// Phải đặt trước /:id
+router.get("/live-status", cameraController.getLiveStatus);
+router.get("/:id/live-frame", cameraController.getLiveFrame);
+router.get("/:id/live-stream", cameraController.getLiveStream);
+
+// Danh sách và chi tiết
 router.get("/", cameraController.getList);
 router.get("/:id", cameraController.getDetail);
 

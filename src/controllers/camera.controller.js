@@ -1,5 +1,5 @@
 const cameraService = require("../services/camera.service");
-
+const cameraStreamService = require("../services/cameraStream.service");
 // =========================================================
 // ERROR HANDLER
 // =========================================================
@@ -160,5 +160,109 @@ exports.remove = async (req, res, next) => {
     });
   } catch (error) {
     handleError(error, next);
+  }
+};
+// =========================================================
+// LIVE CAMERA STATUS
+// =========================================================
+
+exports.getLiveStatus = async (req, res, next) => {
+  try {
+    const cameras = cameraStreamService.getCameraStreamStatus();
+
+    return res.json({
+      success: true,
+      message: "Lấy trạng thái giám sát thành công",
+      data: cameras,
+    });
+  } catch (error) {
+    handleError(error, next);
+  }
+};
+
+// =========================================================
+// LIVE CAMERA FRAME - JPEG
+// =========================================================
+
+exports.getLiveFrame = async (req, res, next) => {
+  try {
+    const id = validateId(req.params.id);
+    const result = cameraStreamService.getCameraLatestFrame(id);
+
+    if (!result) {
+      return res.status(503).json({
+        success: false,
+        message: "Camera chưa có frame hoặc chưa kết nối",
+      });
+    }
+
+    res.set({
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      Pragma: "no-cache",
+    });
+
+    return res.send(result.frame);
+  } catch (error) {
+    handleError(error, next);
+  }
+};
+
+// =========================================================
+// LIVE CAMERA STREAM - MJPEG
+// =========================================================
+
+exports.getLiveStream = async (req, res, next) => {
+  try {
+    const id = validateId(req.params.id);
+
+    res.status(200);
+
+    res.set({
+      "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      Connection: "keep-alive",
+      Pragma: "no-cache",
+      "X-Accel-Buffering": "no",
+    });
+
+    res.flushHeaders?.();
+
+    let lastFrameAt = 0;
+    let closed = false;
+
+    const sendFrame = () => {
+      if (closed || res.destroyed) return;
+
+      const result = cameraStreamService.getCameraLatestFrame(id);
+
+      if (!result || result.capturedAt === lastFrameAt) return;
+
+      lastFrameAt = result.capturedAt;
+
+      res.write(
+        `--frame\r\n` +
+          `Content-Type: image/jpeg\r\n` +
+          `Content-Length: ${result.frame.length}\r\n\r\n`,
+      );
+
+      res.write(result.frame);
+      res.write("\r\n");
+    };
+
+    const timer = setInterval(sendFrame, 100);
+
+    sendFrame();
+
+    req.on("close", () => {
+      closed = true;
+      clearInterval(timer);
+    });
+  } catch (error) {
+    if (!res.headersSent) {
+      handleError(error, next);
+    } else {
+      res.end();
+    }
   }
 };
