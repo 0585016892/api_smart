@@ -1,3 +1,22 @@
+// ======================================================
+// FIX TENSORFLOW DLL PATH FOR WINDOWS
+// ======================================================
+
+const path = require("path");
+
+if (process.platform === "win32") {
+  const tensorflowLibPath = path.resolve(
+    process.cwd(),
+    "node_modules",
+    "@tensorflow",
+    "tfjs-node",
+    "deps",
+    "lib",
+  );
+
+  process.env.PATH = `${tensorflowLibPath};${process.env.PATH || ""}`;
+}
+
 require("dotenv").config();
 
 const app = require("./app");
